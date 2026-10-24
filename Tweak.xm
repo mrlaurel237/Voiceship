@@ -1,6 +1,9 @@
-// VoiceShift 0.3.0 — changeur de voix micro avec bouton flottant.
+// VoiceShift 0.4.0 — changeur de voix micro avec bouton flottant.
 #import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
+#import <objc/runtime.h>
 #import <notify.h>
 #include <substrate.h>
 #include <pthread.h>
@@ -58,84 +61,243 @@ static void vs_push_state(void) {         // publie vers toutes les apps
 }
 
 // ───────────── Traitement audio ─────────────
-#define MAXSLOTS 32
-typedef struct { void *unit; int ch; VSPitch p; } Slot;
+#define MAXSLOTS 64
+typedef struct { void *key; int ch; VSPitch p; } Slot;
 typedef struct { void *unit; int kind; float sr; } UnitInfo;   // kind: 1=float32, 2=s16, 0=non géré
-static Slot     g_slots[MAXSLOTS];  static int g_nslots = 0;
+static Slot     g_slots[MAXSLOTS];  static int g_nslots = 0, g_evict = 0;
 static UnitInfo g_units[MAXSLOTS];  static int g_nunits = 0;
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
+// compteurs de diagnostic : 0=AudioUnit 1=AudioQueue 2=Capture 3=Tap AVAudioEngine
+static volatile uint32_t g_cnt[4] = {0, 0, 0, 0};
 
+static VSPitch *slot_for(void *key, int ch, float sr) {
+    int n = g_nslots;
+    for (int i = 0; i < n; i++) if (g_slots[i].key == key && g_slots[i].ch == ch) return &g_slots[i].p;
+    pthread_mutex_lock(&g_mx);
+    for (int i = 0; i < g_nslots; i++) if (g_slots[i].key == key && g_slots[i].ch == ch) { pthread_mutex_unlock(&g_mx); return &g_slots[i].p; }
+    Slot *s;
+    if (g_nslots < MAXSLOTS) { s = &g_slots[g_nslots]; }
+    else { s = &g_slots[g_evict++ % MAXSLOTS]; }          // plein : on recycle le plus ancien
+    s->key = key; s->ch = ch; vs_pitch_init(&s->p, sr);
+    __sync_synchronize();
+    if (g_nslots < MAXSLOTS && s == &g_slots[g_nslots]) g_nslots++;
+    pthread_mutex_unlock(&g_mx);
+    return &s->p;
+}
+
+// Traite un canal : kind 1 = float32, 2 = int16 ; stride en échantillons
+static void vs_process_channel(void *key, int ch, float sr, int kind, void *base, int frames, int stride) {
+    float semi = g_semi;
+    if (!g_enabled || fabsf(semi) < 0.05f || !base || frames <= 0 || stride <= 0) return;
+    VSPitch *p = slot_for(key, ch, sr);
+    if (!p) return;
+    float target = exp2f(semi / 12.f);
+    float in[512], out[512];
+    int done = 0;
+    while (done < frames) {
+        int n = (frames - done) > 512 ? 512 : (frames - done);
+        if (kind == 1) {
+            float *d = (float *)base + (size_t)done * stride;
+            for (int i = 0; i < n; i++) in[i] = d[(size_t)i * stride];
+            vs_pitch_chunk(p, in, out, n, target);
+            for (int i = 0; i < n; i++) { float v = out[i]; d[(size_t)i * stride] = v > 1.f ? 1.f : (v < -1.f ? -1.f : v); }
+        } else {
+            int16_t *d = (int16_t *)base + (size_t)done * stride;
+            for (int i = 0; i < n; i++) in[i] = d[(size_t)i * stride] * (1.f / 32768.f);
+            vs_pitch_chunk(p, in, out, n, target);
+            for (int i = 0; i < n; i++) {
+                float v = out[i] * 32768.f; v = v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v);
+                d[(size_t)i * stride] = (int16_t)v;
+            }
+        }
+        done += n;
+    }
+}
+
+// Traite un tampon PCM décrit par un ASBD (AudioQueue, CMSampleBuffer…)
+static void vs_process_asbd(void *key, const AudioStreamBasicDescription *a, void *data, UInt32 bytes, int src) {
+    g_cnt[src]++;
+    if (!g_enabled || !data || !a || a->mFormatID != kAudioFormatLinearPCM) return;
+    int kind = 0;
+    if ((a->mFormatFlags & kAudioFormatFlagIsFloat) && a->mBitsPerChannel == 32) kind = 1;
+    else if (!(a->mFormatFlags & kAudioFormatFlagIsFloat) && a->mBitsPerChannel == 16) kind = 2;
+    if (!kind) return;
+    int nch = a->mChannelsPerFrame ? (int)a->mChannelsPerFrame : 1;
+    int bps = (kind == 1) ? 4 : 2;
+    int frames = (int)(bytes / (UInt32)(bps * nch));
+    float sr = a->mSampleRate > 8000 ? (float)a->mSampleRate : 44100.f;
+    BOOL planar = (a->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+    for (int c = 0; c < nch && c < 8; c++) {
+        if (planar) vs_process_channel(key, c, sr, kind, (char *)data + (size_t)c * frames * bps, frames, 1);
+        else        vs_process_channel(key, c, sr, kind, (char *)data + (size_t)c * bps, frames, nch);
+    }
+}
+
+// ── 1) AudioUnit (RemoteIO / VoiceProcessingIO) ──
 static UnitInfo *unit_info(AudioUnit u) {
     for (int i = 0; i < g_nunits; i++) if (g_units[i].unit == (void *)u) return &g_units[i];
     pthread_mutex_lock(&g_mx);
     for (int i = 0; i < g_nunits; i++) if (g_units[i].unit == (void *)u) { pthread_mutex_unlock(&g_mx); return &g_units[i]; }
-    if (g_nunits >= MAXSLOTS) { pthread_mutex_unlock(&g_mx); return NULL; }
+    UnitInfo *ui = (g_nunits < MAXSLOTS) ? &g_units[g_nunits] : &g_units[g_nunits - 1];
     AudioStreamBasicDescription d; UInt32 sz = sizeof d; int kind = 0;
+    memset(&d, 0, sizeof d);
     if (AudioUnitGetProperty(u, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &d, &sz) == noErr
         && d.mFormatID == kAudioFormatLinearPCM) {
         if ((d.mFormatFlags & kAudioFormatFlagIsFloat) && d.mBitsPerChannel == 32) kind = 1;
         else if (!(d.mFormatFlags & kAudioFormatFlagIsFloat) && d.mBitsPerChannel == 16) kind = 2;
     }
-    UnitInfo *ui = &g_units[g_nunits];
     ui->unit = (void *)u; ui->kind = kind; ui->sr = d.mSampleRate > 8000 ? (float)d.mSampleRate : 44100.f;
-    __sync_synchronize(); g_nunits++;
+    __sync_synchronize();
+    if (g_nunits < MAXSLOTS) g_nunits++;
     pthread_mutex_unlock(&g_mx);
     return ui;
-}
-static VSPitch *slot_for(void *unit, int ch, float sr) {
-    for (int i = 0; i < g_nslots; i++) if (g_slots[i].unit == unit && g_slots[i].ch == ch) return &g_slots[i].p;
-    pthread_mutex_lock(&g_mx);
-    for (int i = 0; i < g_nslots; i++) if (g_slots[i].unit == unit && g_slots[i].ch == ch) { pthread_mutex_unlock(&g_mx); return &g_slots[i].p; }
-    if (g_nslots >= MAXSLOTS) { pthread_mutex_unlock(&g_mx); return NULL; }
-    Slot *s = &g_slots[g_nslots];
-    s->unit = unit; s->ch = ch; vs_pitch_init(&s->p, sr);
-    __sync_synchronize(); g_nslots++;
-    pthread_mutex_unlock(&g_mx);
-    return &s->p;
 }
 
 static OSStatus (*orig_render)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *,
                                UInt32, UInt32, AudioBufferList *);
-
 static OSStatus hook_render(AudioUnit unit, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts,
                             UInt32 bus, UInt32 frames, AudioBufferList *io) {
     OSStatus r = orig_render(unit, flags, ts, bus, frames, io);
-    if (r != noErr || bus != 1 || !io || !g_enabled) return r;       // bus 1 = micro
-    float semi = g_semi;
-    if (fabsf(semi) < 0.05f) return r;
+    if (r != noErr || bus != 1 || !io) return r;                    // bus 1 = micro
+    g_cnt[0]++;
+    if (!g_enabled) return r;
     UnitInfo *ui = unit_info(unit);
     if (!ui || !ui->kind) return r;
-    float target = exp2f(semi / 12.f);
     for (UInt32 b = 0; b < io->mNumberBuffers; b++) {
         AudioBuffer *ab = &io->mBuffers[b];
         int nch = ab->mNumberChannels ? (int)ab->mNumberChannels : 1;
         if (!ab->mData) continue;
-        for (int c = 0; c < nch; c++) {
-            VSPitch *p = slot_for(unit, (int)b * 8 + c, ui->sr);
-            if (!p) continue;
-            float in[512], out[512];
-            UInt32 done = 0;
-            while (done < frames) {
-                int n = (int)((frames - done) > 512 ? 512 : (frames - done));
-                if (ui->kind == 1) {
-                    float *d = (float *)ab->mData + (size_t)done * nch + c;
-                    for (int i = 0; i < n; i++) in[i] = d[(size_t)i * nch];
-                    vs_pitch_chunk(p, in, out, n, target);
-                    for (int i = 0; i < n; i++) { float v = out[i]; d[(size_t)i * nch] = v > 1.f ? 1.f : (v < -1.f ? -1.f : v); }
-                } else {
-                    int16_t *d = (int16_t *)ab->mData + (size_t)done * nch + c;
-                    for (int i = 0; i < n; i++) in[i] = d[(size_t)i * nch] * (1.f / 32768.f);
-                    vs_pitch_chunk(p, in, out, n, target);
-                    for (int i = 0; i < n; i++) {
-                        float v = out[i] * 32768.f; v = v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v);
-                        d[(size_t)i * nch] = (int16_t)v;
-                    }
-                }
-                done += (UInt32)n;
-            }
+        for (int c = 0; c < nch && c < 8; c++) {
+            int bps = ui->kind == 1 ? 4 : 2;
+            vs_process_channel((void *)unit, (int)b * 8 + c, ui->sr, ui->kind,
+                               (char *)ab->mData + (size_t)c * bps, (int)frames, nch);
         }
     }
     return r;
+}
+
+// ── 2) AudioQueue (beaucoup d'apps d'enregistrement : WhatsApp, etc.) ──
+typedef struct { AudioQueueInputCallback cb; void *user; AudioStreamBasicDescription fmt; } AQCtx;
+static void aq_cb(void *user, AudioQueueRef q, AudioQueueBufferRef buf, const AudioTimeStamp *ts,
+                  UInt32 n, const AudioStreamPacketDescription *d) {
+    AQCtx *c = (AQCtx *)user;
+    vs_process_asbd((void *)q, &c->fmt, buf->mAudioData, buf->mAudioDataByteSize, 1);
+    c->cb(c->user, q, buf, ts, n, d);
+}
+static OSStatus (*orig_aqNew)(const AudioStreamBasicDescription *, AudioQueueInputCallback, void *,
+                              CFRunLoopRef, CFStringRef, UInt32, AudioQueueRef *);
+static OSStatus hook_aqNew(const AudioStreamBasicDescription *fmt, AudioQueueInputCallback cb, void *user,
+                           CFRunLoopRef rl, CFStringRef mode, UInt32 flags, AudioQueueRef *out) {
+    if (fmt && cb && fmt->mFormatID == kAudioFormatLinearPCM) {
+        AQCtx *c = (AQCtx *)calloc(1, sizeof(AQCtx));
+        c->cb = cb; c->user = user; c->fmt = *fmt;
+        return orig_aqNew(fmt, aq_cb, c, rl, mode, flags, out);
+    }
+    return orig_aqNew(fmt, cb, user, rl, mode, flags, out);
+}
+static OSStatus (*orig_aqNewQ)(AudioQueueRef *, const AudioStreamBasicDescription *, UInt32,
+                               dispatch_queue_t, AudioQueueInputCallbackBlock);
+static OSStatus hook_aqNewQ(AudioQueueRef *out, const AudioStreamBasicDescription *fmt, UInt32 flags,
+                            dispatch_queue_t q, AudioQueueInputCallbackBlock block) {
+    if (fmt && block && fmt->mFormatID == kAudioFormatLinearPCM) {
+        AudioStreamBasicDescription f = *fmt;
+        AudioQueueInputCallbackBlock w = ^(AudioQueueRef aq, AudioQueueBufferRef buf, const AudioTimeStamp *ts,
+                                           UInt32 n, const AudioStreamPacketDescription *d) {
+            vs_process_asbd((void *)aq, &f, buf->mAudioData, buf->mAudioDataByteSize, 1);
+            block(aq, buf, ts, n, d);
+        };
+        return orig_aqNewQ(out, fmt, flags, q, w);
+    }
+    return orig_aqNewQ(out, fmt, flags, q, block);
+}
+
+// ── 3) AVCaptureAudioDataOutput (apps caméra / vidéo avec delegate) ──
+static NSMutableDictionary *g_capOrig = nil;      // nom de classe -> IMP d'origine
+static IMP orig_setDelegate = NULL;
+static IMP orig_tap = NULL;
+
+static void vs_process_sample_buffer(void *key, CMSampleBufferRef sb) {
+    CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb);
+    if (!fd) return;
+    const AudioStreamBasicDescription *a = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
+    if (!a || a->mFormatID != kAudioFormatLinearPCM) return;
+    CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+    if (!bb) return;
+    size_t len = 0, total = 0; char *p = NULL;
+    if (CMBlockBufferGetDataPointer(bb, 0, &len, &total, &p) != kCMBlockBufferNoErr || !p || len != total) return;
+    vs_process_asbd(key, a, p, (UInt32)len, 2);
+}
+static void vs_cap_imp(id self, SEL _cmd, AVCaptureOutput *out, CMSampleBufferRef sb, AVCaptureConnection *conn) {
+    if ([out isKindOfClass:AVCaptureAudioDataOutput.class]) vs_process_sample_buffer((__bridge void *)out, sb);
+    IMP o = NULL;
+    for (Class k = object_getClass(self); k && !o; k = class_getSuperclass(k)) {
+        NSValue *v = g_capOrig[NSStringFromClass(k)];
+        if (v) o = (IMP)[v pointerValue];
+    }
+    if (o) ((void (*)(id, SEL, id, CMSampleBufferRef, id))o)(self, _cmd, out, sb, conn);
+}
+static Class vs_owner(Class c, SEL s) {
+    for (Class k = c; k; k = class_getSuperclass(k)) {
+        unsigned n = 0; Method *l = class_copyMethodList(k, &n); BOOL f = NO;
+        for (unsigned i = 0; i < n; i++) if (method_getName(l[i]) == s) { f = YES; break; }
+        free(l);
+        if (f) return k;
+    }
+    return Nil;
+}
+static void vs_swizzle_delegate(id del) {
+    if (!del) return;
+    SEL s = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
+    Class owner = vs_owner(object_getClass(del), s);
+    if (!owner) return;
+    @synchronized ([NSProcessInfo processInfo]) {
+        if (!g_capOrig) g_capOrig = [NSMutableDictionary new];
+        NSString *name = NSStringFromClass(owner);
+        if (g_capOrig[name]) return;
+        Method m = class_getInstanceMethod(owner, s);
+        if (!m) return;
+        g_capOrig[name] = [NSValue valueWithPointer:(void *)method_getImplementation(m)];
+        method_setImplementation(m, (IMP)vs_cap_imp);
+    }
+}
+static void vs_setdel_imp(id self, SEL _cmd, id delegate, dispatch_queue_t q) {
+    vs_swizzle_delegate(delegate);
+    ((void (*)(id, SEL, id, dispatch_queue_t))orig_setDelegate)(self, _cmd, delegate, q);
+}
+
+// ── 4) AVAudioEngine : tap sur le micro (inputNode) ──
+static void vs_process_pcmbuffer(void *key, AVAudioPCMBuffer *buf) {
+    g_cnt[3]++;
+    if (!g_enabled) return;
+    int n = (int)buf.frameLength, nch = (int)buf.format.channelCount, st = (int)buf.stride;
+    float sr = (float)buf.format.sampleRate;
+    if (buf.floatChannelData) {
+        for (int c = 0; c < nch && c < 8; c++) vs_process_channel(key, c, sr, 1, buf.floatChannelData[c], n, st);
+    } else if (buf.int16ChannelData) {
+        for (int c = 0; c < nch && c < 8; c++) vs_process_channel(key, c, sr, 2, buf.int16ChannelData[c], n, st);
+    }
+}
+static void vs_tap_imp(id self, SEL _cmd, AVAudioNodeBus bus, AVAudioFrameCount size, AVAudioFormat *fmt, AVAudioNodeTapBlock block) {
+    AVAudioNodeTapBlock w = block;
+    if (block && [self isKindOfClass:NSClassFromString(@"AVAudioInputNode")]) {
+        void *key = (__bridge void *)self;
+        w = ^(AVAudioPCMBuffer *buf, AVAudioTime *when) { vs_process_pcmbuffer(key, buf); block(buf, when); };
+    }
+    ((void (*)(id, SEL, AVAudioNodeBus, AVAudioFrameCount, AVAudioFormat *, AVAudioNodeTapBlock))orig_tap)(self, _cmd, bus, size, fmt, w);
+}
+
+static void vs_install_objc_hooks(void) {
+    static BOOL tapDone = NO, capDone = NO;
+    if (!tapDone) {
+        Class c = NSClassFromString(@"AVAudioNode");
+        Method m = c ? class_getInstanceMethod(c, @selector(installTapOnBus:bufferSize:format:block:)) : NULL;
+        if (m) { orig_tap = method_setImplementation(m, (IMP)vs_tap_imp); tapDone = YES; }
+    }
+    if (!capDone) {
+        Class c = NSClassFromString(@"AVCaptureAudioDataOutput");
+        Method m = c ? class_getInstanceMethod(c, @selector(setSampleBufferDelegate:queue:)) : NULL;
+        if (m) { orig_setDelegate = method_setImplementation(m, (IMP)vs_setdel_imp); capDone = YES; }
+    }
 }
 
 // ───────────── Interface : bouton flottant + panneau ─────────────
@@ -145,6 +307,8 @@ static OSStatus hook_render(AudioUnit unit, AudioUnitRenderActionFlags *flags, c
 @property (nonatomic, strong) UISwitch *sw;
 @property (nonatomic, strong) UISlider *slider;
 @property (nonatomic, strong) UILabel *valueLabel;
+@property (nonatomic, strong) UILabel *diag;
+@property (nonatomic, strong) NSTimer *timer;
 - (void)refreshFromState;
 @end
 
@@ -224,10 +388,10 @@ static VSRootVC *g_vc = nil;
         [b addTarget:self action:@selector(preset:) forControlEvents:UIControlEventTouchUpInside];
         [p addSubview:b];
     }
-    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(16, 236, 268, 28)];
-    hint.text = @"Valeur par défaut : +5 (voix grave → voix féminine)";
-    hint.textColor = [UIColor colorWithWhite:0.55 alpha:1]; hint.font = [UIFont systemFontOfSize:11]; hint.numberOfLines = 2;
-    [p addSubview:hint];
+    self.diag = [[UILabel alloc] initWithFrame:CGRectMake(16, 234, 268, 32)];
+    self.diag.textColor = [UIColor colorWithWhite:0.6 alpha:1]; self.diag.font = [UIFont systemFontOfSize:11];
+    self.diag.numberOfLines = 2;
+    [p addSubview:self.diag];
 
     [self.view addSubview:p];
     [self refreshFromState];
@@ -246,7 +410,20 @@ static VSRootVC *g_vc = nil;
     self.valueLabel.text = [NSString stringWithFormat:@"%+.1f demi-tons — %@", s, d];
     self.fab.alpha = g_enabled ? 0.92 : 0.45;
 }
-- (void)togglePanel { self.panel.hidden = !self.panel.hidden; [self refreshFromState]; }
+- (void)updateDiag {
+    self.diag.text = [NSString stringWithFormat:@"Audio micro vu dans cette app :\nAU %u · AQ %u · Cap %u · Tap %u",
+                      g_cnt[0], g_cnt[1], g_cnt[2], g_cnt[3]];
+}
+- (void)togglePanel {
+    self.panel.hidden = !self.panel.hidden;
+    [self refreshFromState];
+    [self.timer invalidate]; self.timer = nil;
+    if (!self.panel.hidden) {
+        [self updateDiag];
+        __weak typeof(self) ws = self;
+        self.timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { [ws updateDiag]; }];
+    }
+}
 - (void)dragFab:(UIPanGestureRecognizer *)g {
     CGPoint t = [g translationInView:self.view];
     CGPoint c = CGPointMake(self.fab.center.x + t.x, self.fab.center.y + t.y);
@@ -299,8 +476,11 @@ static void vs_show_ui(void) {
         else vs_pull_state();
 
         MSHookFunction((void *)AudioUnitRender, (void *)hook_render, (void **)&orig_render);
+        MSHookFunction((void *)AudioQueueNewInput, (void *)hook_aqNew, (void **)&orig_aqNew);
+        MSHookFunction((void *)AudioQueueNewInputWithDispatchQueue, (void *)hook_aqNewQ, (void **)&orig_aqNewQ);
+        vs_install_objc_hooks();
 
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
-            object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { vs_show_ui(); }];
+            object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { vs_install_objc_hooks(); vs_show_ui(); }];
     }
 }
