@@ -1,4 +1,4 @@
-// VoiceShift 0.7.0 — changeur de voix micro avec bouton flottant.
+// VoiceShift 0.8.0 — changeur de voix micro avec bouton flottant.
 #import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <AVFoundation/AVFoundation.h>
@@ -19,12 +19,16 @@
 static volatile int   g_enabled = 1;
 static volatile float g_semi    = 8.0f;     // hauteur de la voix (demi-tons)
 static volatile float g_form    = 3.0f;     // timbre / formants (demi-tons)
+static volatile int   g_mode    = 1;        // qualité : 0=A standard 1=B naturel 2=C doux 3=D très doux
+static const float kModeTone[4] = {0.f, 6000.f, 4500.f, 3500.f};    // au-dessus : texture naturelle conservée (moins de métal)
+static const float kModeLP[4]   = {0.f, 11000.f, 8000.f, 6500.f};   // filtre passe-bas doux (0 = aucun)
+static NSString *vs_mode_name(int m) { static NSString *n[4] = {@"A — standard", @"B — naturel", @"C — doux", @"D — très doux"}; return n[m & 3]; }
 static int  g_token = 0;
 static BOOL g_isSpringBoard = NO;
 static const char *kNote = "com.local.voiceshift.changed";
 static const char *kConf[] = {
-    "/var/jb/var/mobile/Library/Preferences/voiceshift.v5.conf",
-    "/var/mobile/Library/Preferences/voiceshift.v5.conf" };
+    "/var/jb/var/mobile/Library/Preferences/voiceshift.v6.conf",
+    "/var/mobile/Library/Preferences/voiceshift.v6.conf" };
 
 static void vs_apply(int en, float semi, float form) {
     if (semi < -12.f) semi = -12.f;
@@ -43,6 +47,7 @@ static void vs_load_file(void) {
             if (sscanf(line, "enabled=%d", &ie) == 1) e = ie;
             else if (sscanf(line, "semitones=%f", &is) == 1) s = is;
             else if (sscanf(line, "formant=%f", &is) == 1) fm = is;
+            else if (sscanf(line, "mode=%d", &ie) == 1) g_mode = ie & 3;
         }
         fclose(f); vs_apply(e, s, fm); return;
     }
@@ -51,7 +56,7 @@ static void vs_save_file(void) {          // ne réussit que dans les processus 
     for (int k = 0; k < 2; k++) {
         FILE *f = fopen(kConf[k], "w");
         if (!f) continue;
-        fprintf(f, "enabled=%d\nsemitones=%.1f\nformant=%.1f\n", g_enabled, g_semi, g_form);
+        fprintf(f, "enabled=%d\nsemitones=%.1f\nformant=%.1f\nmode=%d\n", g_enabled, g_semi, g_form, g_mode);
         fclose(f); return;
     }
 }
@@ -61,11 +66,13 @@ static void vs_pull_state(void) {         // lit l'état global (notifyd)
     if (!(st & (1ULL << 63))) return;
     vs_apply((int)(st & 1), ((float)((int)((st >> 8) & 0xFF) - 120)) / 10.0f,
              ((float)((int)((st >> 16) & 0xFF) - 120)) / 10.0f);
+    g_mode = (int)((st >> 24) & 3);
 }
 static void vs_push_state(void) {         // publie vers toutes les apps
     uint64_t st = (1ULL << 63) | (uint64_t)(g_enabled & 1)
                 | ((uint64_t)((int)lroundf(g_semi * 10.f) + 120) << 8)
-                | ((uint64_t)((int)lroundf(g_form * 10.f) + 120) << 16);
+                | ((uint64_t)((int)lroundf(g_form * 10.f) + 120) << 16)
+                | ((uint64_t)(g_mode & 3) << 24);
     notify_set_state(g_token, st);
     notify_post(kNote);
 }
@@ -74,17 +81,21 @@ static void vs_push_state(void) {         // publie vers toutes les apps
 #ifdef VS_STRETCH
 struct VSEngine {
     signalsmith::stretch::SignalsmithStretch<float> st;
-    float lastSemi = -999.f, lastForm = -999.f;
+    float lastSemi = -999.f, lastForm = -999.f, lastTone = -999.f, sr = 48000.f;
 };
 static VSEngine *eng_new(float sr) {
     VSEngine *e = new VSEngine();
+    e->sr = sr;
     e->st.presetDefault(1, sr, true);              // bloc 120 ms, calcul réparti pour le temps réel
-    e->st.setFormantBase(130.f / sr);              // fondamentale moyenne d'une voix grave (relative à la fréquence d'échantillonnage)
+    e->st.setFormantBase(110.f / sr);              // fondamentale moyenne d'une voix grave (relative à la fréquence d'échantillonnage)
     return e;
 }
 static void eng_free(VSEngine *e) { delete e; }
-static void eng_chunk(VSEngine *e, const float *in, float *out, int n, float semi, float form) {
-    if (semi != e->lastSemi) { e->st.setTransposeSemitones(semi); e->lastSemi = semi; }
+static void eng_chunk(VSEngine *e, const float *in, float *out, int n, float semi, float form, float toneHz) {
+    if (semi != e->lastSemi || toneHz != e->lastTone) {
+        e->st.setTransposeSemitones(semi, toneHz > 0.f ? toneHz / e->sr : 0.f);   // limite de tonalité : garde les aigus plus naturels
+        e->lastSemi = semi; e->lastTone = toneHz;
+    }
     if (form != e->lastForm) { e->st.setFormantSemitones(form, true); e->lastForm = form; }   // timbre indépendant de la hauteur
     float *ib[1] = { const_cast<float *>(in) };
     float *ob[1] = { out };
@@ -94,14 +105,28 @@ static void eng_chunk(VSEngine *e, const float *in, float *out, int n, float sem
 typedef VSPitch VSEngine;                           // repli : PSOLA maison (vs_dsp.h)
 static VSEngine *eng_new(float sr) { VSEngine *e = (VSEngine *)malloc(sizeof(VSEngine)); vs_pitch_init(e, sr); return e; }
 static void eng_free(VSEngine *e) { free(e); }
-static void eng_chunk(VSEngine *e, const float *in, float *out, int n, float semi, float form) {
+static void eng_chunk(VSEngine *e, const float *in, float *out, int n, float semi, float form, float toneHz) {
+    (void)toneHz;
     vs_pitch_chunk(e, in, out, n, exp2f(semi / 12.f), exp2f(form / 12.f));
 }
 #endif
 
 // ───────────── Traitement audio ─────────────
 #define MAXSLOTS 16
-typedef struct { void *key; int ch; VSEngine *p; } Slot;
+typedef struct { float b0, b1, b2, a1, a2, z1, z2; } Bq;
+static void bq_make(Bq *q, int hp, float fc, float sr, float Q) {      // filtre biquad (RBJ)
+    float w = 2.f * 3.14159265f * fc / sr, c = cosf(w), sn = sinf(w), al = sn / (2.f * Q), a0 = 1.f + al;
+    if (hp) { q->b0 = (1.f + c) / 2.f / a0; q->b1 = -(1.f + c) / a0; q->b2 = q->b0; }
+    else    { q->b0 = (1.f - c) / 2.f / a0; q->b1 = (1.f - c) / a0;  q->b2 = q->b0; }
+    q->a1 = -2.f * c / a0; q->a2 = (1.f - al) / a0;
+}
+static inline float bq_run(Bq *q, float x) {
+    float y = q->b0 * x + q->z1;
+    q->z1 = q->b1 * x - q->a1 * y + q->z2;
+    q->z2 = q->b2 * x - q->a2 * y;
+    return y;
+}
+typedef struct { void *key; int ch; VSEngine *p; Bq lp, hp; int mode; float sr; } Slot;
 typedef struct { void *unit; int kind; float sr; } UnitInfo;   // kind: 1=float32, 2=s16, 0=non géré
 static Slot     g_slots[MAXSLOTS];  static int g_nslots = 0, g_evict = 0;
 static UnitInfo g_units[MAXSLOTS];  static int g_nunits = 0;
@@ -117,28 +142,38 @@ static BOOL vs_claim(int src) {
     return NO;
 }
 
-static VSEngine *slot_for(void *key, int ch, float sr) {
+static Slot *slot_for(void *key, int ch, float sr) {
     int n = g_nslots;
-    for (int i = 0; i < n; i++) if (g_slots[i].key == key && g_slots[i].ch == ch) return g_slots[i].p;
+    for (int i = 0; i < n; i++) if (g_slots[i].key == key && g_slots[i].ch == ch) return &g_slots[i];
     pthread_mutex_lock(&g_mx);
-    for (int i = 0; i < g_nslots; i++) if (g_slots[i].key == key && g_slots[i].ch == ch) { pthread_mutex_unlock(&g_mx); return g_slots[i].p; }
+    for (int i = 0; i < g_nslots; i++) if (g_slots[i].key == key && g_slots[i].ch == ch) { pthread_mutex_unlock(&g_mx); return &g_slots[i]; }
     Slot *s;
     if (g_nslots < MAXSLOTS) { s = &g_slots[g_nslots]; }
     else { s = &g_slots[g_evict++ % MAXSLOTS]; }          // plein : on recycle le plus ancien
     if (s->p) { eng_free(s->p); s->p = NULL; }
     s->key = key; s->ch = ch; s->p = eng_new(sr);
+    memset(&s->lp, 0, sizeof(Bq)); memset(&s->hp, 0, sizeof(Bq)); s->mode = -1; s->sr = sr;
     __sync_synchronize();
     if (g_nslots < MAXSLOTS && s == &g_slots[g_nslots]) g_nslots++;
     pthread_mutex_unlock(&g_mx);
-    return s->p;
+    return s;
 }
 
 // Traite un canal : kind 1 = float32, 2 = int16 ; stride en échantillons
 static void vs_process_channel(void *key, int ch, float sr, int kind, void *base, int frames, int stride) {
     float semi = g_semi, form = g_form;
     if (!g_enabled || (fabsf(semi) < 0.05f && fabsf(form) < 0.05f) || !base || frames <= 0 || stride <= 0) return;
-    VSEngine *p = slot_for(key, ch, sr);
-    if (!p) return;
+    Slot *sl = slot_for(key, ch, sr);
+    if (!sl || !sl->p) return;
+    VSEngine *p = sl->p;
+    int mode = g_mode & 3;
+    if (sl->mode != mode) {                                  // (re)calcule les filtres quand le mode change
+        bq_make(&sl->hp, 1, 80.f, sl->sr, 0.707f);
+        if (kModeLP[mode] > 0.f && kModeLP[mode] < sl->sr * 0.45f) bq_make(&sl->lp, 0, kModeLP[mode], sl->sr, 0.707f);
+        else { sl->lp.b0 = 1.f; sl->lp.b1 = sl->lp.b2 = sl->lp.a1 = sl->lp.a2 = 0.f; }
+        sl->mode = mode;
+    }
+    float toneHz = kModeTone[mode];
     float in[512], out[512];
     int done = 0;
     while (done < frames) {
@@ -146,12 +181,14 @@ static void vs_process_channel(void *key, int ch, float sr, int kind, void *base
         if (kind == 1) {
             float *d = (float *)base + (size_t)done * stride;
             for (int i = 0; i < n; i++) in[i] = d[(size_t)i * stride];
-            eng_chunk(p, in, out, n, semi, form);
+            eng_chunk(p, in, out, n, semi, form, toneHz);
+            for (int i = 0; i < n; i++) out[i] = bq_run(&sl->hp, bq_run(&sl->lp, out[i]));
             for (int i = 0; i < n; i++) { float v = out[i]; d[(size_t)i * stride] = v > 1.f ? 1.f : (v < -1.f ? -1.f : v); }
         } else {
             int16_t *d = (int16_t *)base + (size_t)done * stride;
             for (int i = 0; i < n; i++) in[i] = d[(size_t)i * stride] * (1.f / 32768.f);
-            eng_chunk(p, in, out, n, semi, form);
+            eng_chunk(p, in, out, n, semi, form, toneHz);
+            for (int i = 0; i < n; i++) out[i] = bq_run(&sl->hp, bq_run(&sl->lp, out[i]));
             for (int i = 0; i < n; i++) {
                 float v = out[i] * 32768.f; v = v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v);
                 d[(size_t)i * stride] = (int16_t)v;
@@ -355,6 +392,7 @@ static void vs_install_objc_hooks(void) {
 @property (nonatomic, strong) UISlider *slider;
 @property (nonatomic, strong) UISlider *fslider;
 @property (nonatomic, strong) UILabel *fLabel;
+@property (nonatomic, strong) UIButton *modeBtn;
 @property (nonatomic, strong) UILabel *valueLabel;
 @property (nonatomic, strong) UILabel *diag;
 @property (nonatomic, strong) NSTimer *timer;
@@ -389,7 +427,7 @@ static VSRootVC *g_vc = nil;
     [self.fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragFab:)]];
     [self.view addSubview:self.fab];
 
-    UIView *p = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 300, 346)];
+    UIView *p = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 300, 404)];
     p.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.96];
     p.layer.cornerRadius = 18; p.hidden = YES;
     self.panel = p;
@@ -443,17 +481,24 @@ static VSRootVC *g_vc = nil;
     [self.fslider addTarget:self action:@selector(slDone:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
     [p addSubview:self.fslider];
 
+    self.modeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.modeBtn.frame = CGRectMake(16, 262, 268, 38);
+    self.modeBtn.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1]; self.modeBtn.layer.cornerRadius = 10;
+    self.modeBtn.titleLabel.font = [UIFont systemFontOfSize:13];
+    [self.modeBtn addTarget:self action:@selector(modeTap) forControlEvents:UIControlEventTouchUpInside];
+    [p addSubview:self.modeBtn];
+
     NSArray *titles = @[@"Homme → Femme", @"Femme → Homme", @"Original"];
     for (int i = 0; i < 3; i++) {
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(12 + i * 93, 264, 90, 40);
+        b.frame = CGRectMake(12 + i * 93, 312, 90, 40);
         b.titleLabel.font = [UIFont systemFontOfSize:12]; b.titleLabel.numberOfLines = 2; b.titleLabel.textAlignment = NSTextAlignmentCenter;
         b.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1]; b.layer.cornerRadius = 10;
         [b setTitle:titles[i] forState:UIControlStateNormal]; b.tag = i;
         [b addTarget:self action:@selector(preset:) forControlEvents:UIControlEventTouchUpInside];
         [p addSubview:b];
     }
-    self.diag = [[UILabel alloc] initWithFrame:CGRectMake(16, 308, 268, 32)];
+    self.diag = [[UILabel alloc] initWithFrame:CGRectMake(16, 360, 268, 32)];
     self.diag.textColor = [UIColor colorWithWhite:0.6 alpha:1]; self.diag.font = [UIFont systemFontOfSize:11];
     self.diag.numberOfLines = 2;
     [p addSubview:self.diag];
@@ -472,6 +517,7 @@ static VSRootVC *g_vc = nil;
     self.slider.enabled = g_enabled;
     self.fslider.value = g_form;
     self.fslider.enabled = g_enabled;
+    [self.modeBtn setTitle:[NSString stringWithFormat:@"Qualité %@  (touche pour changer)", vs_mode_name(g_mode)] forState:UIControlStateNormal];
     float s = g_semi;
     NSString *d = s > 0.05f ? @"plus aigu" : (s < -0.05f ? @"plus grave" : @"voix d'origine");
     self.valueLabel.text = [NSString stringWithFormat:@"Hauteur : %+.1f demi-tons — %@", s, d];
@@ -505,6 +551,10 @@ static VSRootVC *g_vc = nil;
 - (void)slChanged:(UISlider *)s {
     float v = roundf(s.value * 2.f) / 2.f;          // pas de 0,5 demi-ton
     vs_apply(g_enabled, v, g_form); vs_push_state(); [self refreshFromState];
+}
+- (void)modeTap {
+    g_mode = (g_mode + 1) & 3;
+    vs_push_state(); [self refreshFromState]; if (g_isSpringBoard) vs_save_file();
 }
 - (void)fmChanged:(UISlider *)s {
     float v = roundf(s.value * 2.f) / 2.f;

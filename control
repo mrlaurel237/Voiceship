@@ -1,6 +1,6 @@
 Package: com.local.voiceshift
 Name: VoiceShift
-Version: 0.7.0
+Version: 0.8.0
 Architecture: iphoneos-arm64
 Depends: firmware (>= 15.0), ellekit | mobilesubstrate
 Description: Changeur de voix micro naturel (Signalsmith Stretch, hauteur + timbre, bouton flottant)
