@@ -1,4 +1,4 @@
-// VoiceShift 0.4.0 — changeur de voix micro avec bouton flottant.
+// VoiceShift 0.5.0 — changeur de voix micro avec bouton flottant.
 #import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <AVFoundation/AVFoundation.h>
@@ -11,39 +11,43 @@
 #include "vs_dsp.h"
 
 // ───────────── Réglages partagés entre toutes les apps ─────────────
-// Défaut : activé, +5 demi-tons (voix grave -> voix féminine).
+// Défaut : activé, hauteur +6 demi-tons, timbre +2,5 (voix grave -> voix féminine naturelle).
 static volatile int   g_enabled = 1;
-static volatile float g_semi    = 5.0f;
+static volatile float g_semi    = 6.0f;     // hauteur de la voix (demi-tons)
+static volatile float g_form    = 2.5f;     // timbre / formants (demi-tons)
 static int  g_token = 0;
 static BOOL g_isSpringBoard = NO;
 static const char *kNote = "com.local.voiceshift.changed";
 static const char *kConf[] = {
-    "/var/jb/var/mobile/Library/Preferences/voiceshift.v3.conf",
-    "/var/mobile/Library/Preferences/voiceshift.v3.conf" };
+    "/var/jb/var/mobile/Library/Preferences/voiceshift.v4.conf",
+    "/var/mobile/Library/Preferences/voiceshift.v4.conf" };
 
-static void vs_apply(int en, float semi) {
+static void vs_apply(int en, float semi, float form) {
     if (semi < -12.f) semi = -12.f;
     if (semi >  12.f) semi =  12.f;
-    g_semi = semi; g_enabled = en ? 1 : 0;
+    if (form <  -6.f) form =  -6.f;
+    if (form >   6.f) form =   6.f;
+    g_semi = semi; g_form = form; g_enabled = en ? 1 : 0;
 }
 static void vs_load_file(void) {
     for (int k = 0; k < 2; k++) {
         FILE *f = fopen(kConf[k], "r");
         if (!f) continue;
-        char line[64]; int e = g_enabled; float s = g_semi;
+        char line[64]; int e = g_enabled; float s = g_semi, fm = g_form;
         while (fgets(line, sizeof line, f)) {
             int ie; float is;
             if (sscanf(line, "enabled=%d", &ie) == 1) e = ie;
             else if (sscanf(line, "semitones=%f", &is) == 1) s = is;
+            else if (sscanf(line, "formant=%f", &is) == 1) fm = is;
         }
-        fclose(f); vs_apply(e, s); return;
+        fclose(f); vs_apply(e, s, fm); return;
     }
 }
 static void vs_save_file(void) {          // ne réussit que dans les processus non sandboxés
     for (int k = 0; k < 2; k++) {
         FILE *f = fopen(kConf[k], "w");
         if (!f) continue;
-        fprintf(f, "enabled=%d\nsemitones=%.1f\n", g_enabled, g_semi);
+        fprintf(f, "enabled=%d\nsemitones=%.1f\nformant=%.1f\n", g_enabled, g_semi, g_form);
         fclose(f); return;
     }
 }
@@ -51,17 +55,19 @@ static void vs_pull_state(void) {         // lit l'état global (notifyd)
     uint64_t st = 0;
     if (notify_get_state(g_token, &st) != NOTIFY_STATUS_OK) return;
     if (!(st & (1ULL << 63))) return;
-    vs_apply((int)(st & 1), ((float)((int)((st >> 8) & 0xFF) - 120)) / 10.0f);
+    vs_apply((int)(st & 1), ((float)((int)((st >> 8) & 0xFF) - 120)) / 10.0f,
+             ((float)((int)((st >> 16) & 0xFF) - 120)) / 10.0f);
 }
 static void vs_push_state(void) {         // publie vers toutes les apps
     uint64_t st = (1ULL << 63) | (uint64_t)(g_enabled & 1)
-                | ((uint64_t)((int)lroundf(g_semi * 10.f) + 120) << 8);
+                | ((uint64_t)((int)lroundf(g_semi * 10.f) + 120) << 8)
+                | ((uint64_t)((int)lroundf(g_form * 10.f) + 120) << 16);
     notify_set_state(g_token, st);
     notify_post(kNote);
 }
 
 // ───────────── Traitement audio ─────────────
-#define MAXSLOTS 64
+#define MAXSLOTS 16
 typedef struct { void *key; int ch; VSPitch p; } Slot;
 typedef struct { void *unit; int kind; float sr; } UnitInfo;   // kind: 1=float32, 2=s16, 0=non géré
 static Slot     g_slots[MAXSLOTS];  static int g_nslots = 0, g_evict = 0;
@@ -87,11 +93,11 @@ static VSPitch *slot_for(void *key, int ch, float sr) {
 
 // Traite un canal : kind 1 = float32, 2 = int16 ; stride en échantillons
 static void vs_process_channel(void *key, int ch, float sr, int kind, void *base, int frames, int stride) {
-    float semi = g_semi;
-    if (!g_enabled || fabsf(semi) < 0.05f || !base || frames <= 0 || stride <= 0) return;
+    float semi = g_semi, form = g_form;
+    if (!g_enabled || (fabsf(semi) < 0.05f && fabsf(form) < 0.05f) || !base || frames <= 0 || stride <= 0) return;
     VSPitch *p = slot_for(key, ch, sr);
     if (!p) return;
-    float target = exp2f(semi / 12.f);
+    float target = exp2f(semi / 12.f), alpha = exp2f(form / 12.f);
     float in[512], out[512];
     int done = 0;
     while (done < frames) {
@@ -99,12 +105,12 @@ static void vs_process_channel(void *key, int ch, float sr, int kind, void *base
         if (kind == 1) {
             float *d = (float *)base + (size_t)done * stride;
             for (int i = 0; i < n; i++) in[i] = d[(size_t)i * stride];
-            vs_pitch_chunk(p, in, out, n, target);
+            vs_pitch_chunk(p, in, out, n, target, alpha);
             for (int i = 0; i < n; i++) { float v = out[i]; d[(size_t)i * stride] = v > 1.f ? 1.f : (v < -1.f ? -1.f : v); }
         } else {
             int16_t *d = (int16_t *)base + (size_t)done * stride;
             for (int i = 0; i < n; i++) in[i] = d[(size_t)i * stride] * (1.f / 32768.f);
-            vs_pitch_chunk(p, in, out, n, target);
+            vs_pitch_chunk(p, in, out, n, target, alpha);
             for (int i = 0; i < n; i++) {
                 float v = out[i] * 32768.f; v = v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v);
                 d[(size_t)i * stride] = (int16_t)v;
@@ -306,6 +312,8 @@ static void vs_install_objc_hooks(void) {
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UISwitch *sw;
 @property (nonatomic, strong) UISlider *slider;
+@property (nonatomic, strong) UISlider *fslider;
+@property (nonatomic, strong) UILabel *fLabel;
 @property (nonatomic, strong) UILabel *valueLabel;
 @property (nonatomic, strong) UILabel *diag;
 @property (nonatomic, strong) NSTimer *timer;
@@ -340,7 +348,7 @@ static VSRootVC *g_vc = nil;
     [self.fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragFab:)]];
     [self.view addSubview:self.fab];
 
-    UIView *p = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 300, 270)];
+    UIView *p = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 300, 346)];
     p.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.96];
     p.layer.cornerRadius = 18; p.hidden = YES;
     self.panel = p;
@@ -378,17 +386,33 @@ static VSRootVC *g_vc = nil;
     [self.slider addTarget:self action:@selector(slDone:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
     [p addSubview:self.slider];
 
+    self.fLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 182, 268, 22)];
+    self.fLabel.textColor = [UIColor colorWithWhite:0.85 alpha:1]; self.fLabel.font = [UIFont systemFontOfSize:14];
+    [p addSubview:self.fLabel];
+    UILabel *flo = [[UILabel alloc] initWithFrame:CGRectMake(16, 206, 90, 18)];
+    flo.text = @"timbre ♂"; flo.textColor = [UIColor colorWithWhite:0.6 alpha:1]; flo.font = [UIFont systemFontOfSize:11];
+    [p addSubview:flo];
+    UILabel *fhi = [[UILabel alloc] initWithFrame:CGRectMake(194, 206, 90, 18)];
+    fhi.text = @"timbre ♀"; fhi.textAlignment = NSTextAlignmentRight;
+    fhi.textColor = [UIColor colorWithWhite:0.6 alpha:1]; fhi.font = [UIFont systemFontOfSize:11];
+    [p addSubview:fhi];
+    self.fslider = [[UISlider alloc] initWithFrame:CGRectMake(16, 224, 268, 30)];
+    self.fslider.minimumValue = -6; self.fslider.maximumValue = 6;
+    [self.fslider addTarget:self action:@selector(fmChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.fslider addTarget:self action:@selector(slDone:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+    [p addSubview:self.fslider];
+
     NSArray *titles = @[@"Homme → Femme", @"Femme → Homme", @"Original"];
     for (int i = 0; i < 3; i++) {
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(12 + i * 93, 190, 90, 40);
+        b.frame = CGRectMake(12 + i * 93, 264, 90, 40);
         b.titleLabel.font = [UIFont systemFontOfSize:12]; b.titleLabel.numberOfLines = 2; b.titleLabel.textAlignment = NSTextAlignmentCenter;
         b.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1]; b.layer.cornerRadius = 10;
         [b setTitle:titles[i] forState:UIControlStateNormal]; b.tag = i;
         [b addTarget:self action:@selector(preset:) forControlEvents:UIControlEventTouchUpInside];
         [p addSubview:b];
     }
-    self.diag = [[UILabel alloc] initWithFrame:CGRectMake(16, 234, 268, 32)];
+    self.diag = [[UILabel alloc] initWithFrame:CGRectMake(16, 308, 268, 32)];
     self.diag.textColor = [UIColor colorWithWhite:0.6 alpha:1]; self.diag.font = [UIFont systemFontOfSize:11];
     self.diag.numberOfLines = 2;
     [p addSubview:self.diag];
@@ -405,9 +429,12 @@ static VSRootVC *g_vc = nil;
     self.sw.on = g_enabled;
     self.slider.value = g_semi;
     self.slider.enabled = g_enabled;
+    self.fslider.value = g_form;
+    self.fslider.enabled = g_enabled;
     float s = g_semi;
     NSString *d = s > 0.05f ? @"plus aigu" : (s < -0.05f ? @"plus grave" : @"voix d'origine");
-    self.valueLabel.text = [NSString stringWithFormat:@"%+.1f demi-tons — %@", s, d];
+    self.valueLabel.text = [NSString stringWithFormat:@"Hauteur : %+.1f demi-tons — %@", s, d];
+    self.fLabel.text = [NSString stringWithFormat:@"Timbre : %+.1f (%@)", g_form, g_form > 0.05f ? @"plus clair" : (g_form < -0.05f ? @"plus sombre" : @"d'origine")];
     self.fab.alpha = g_enabled ? 0.92 : 0.45;
 }
 - (void)updateDiag {
@@ -431,15 +458,20 @@ static VSRootVC *g_vc = nil;
     c.x = MAX(26, MIN(b.size.width - 26, c.x)); c.y = MAX(60, MIN(b.size.height - 60, c.y));
     self.fab.center = c; [g setTranslation:CGPointZero inView:self.view];
 }
-- (void)swChanged:(UISwitch *)s { vs_apply(s.on, g_semi); vs_push_state(); [self refreshFromState]; if (g_isSpringBoard) vs_save_file(); }
+- (void)swChanged:(UISwitch *)s { vs_apply(s.on, g_semi, g_form); vs_push_state(); [self refreshFromState]; if (g_isSpringBoard) vs_save_file(); }
 - (void)slChanged:(UISlider *)s {
     float v = roundf(s.value * 2.f) / 2.f;          // pas de 0,5 demi-ton
-    vs_apply(g_enabled, v); vs_push_state(); [self refreshFromState];
+    vs_apply(g_enabled, v, g_form); vs_push_state(); [self refreshFromState];
+}
+- (void)fmChanged:(UISlider *)s {
+    float v = roundf(s.value * 2.f) / 2.f;
+    vs_apply(g_enabled, g_semi, v); vs_push_state(); [self refreshFromState];
 }
 - (void)slDone:(UISlider *)s { if (g_isSpringBoard) vs_save_file(); }
 - (void)preset:(UIButton *)b {
-    float v = b.tag == 0 ? 5.f : (b.tag == 1 ? -5.f : 0.f);
-    vs_apply(1, v); vs_push_state(); [self refreshFromState]; if (g_isSpringBoard) vs_save_file();
+    float v  = b.tag == 0 ?  6.f : (b.tag == 1 ? -6.f : 0.f);
+    float fm = b.tag == 0 ? 2.5f : (b.tag == 1 ? -2.5f : 0.f);
+    vs_apply(1, v, fm); vs_push_state(); [self refreshFromState]; if (g_isSpringBoard) vs_save_file();
 }
 @end
 

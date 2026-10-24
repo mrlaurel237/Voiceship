@@ -1,64 +1,194 @@
-// VoiceShift DSP: décaleur de hauteur (pitch shifter) à deux têtes de lecture
-// avec fondu enchaîné (Hann). Décale aussi les formants, ce qui est voulu
-// pour un changement de genre de la voix.
+// VoiceShift DSP v2 : PSOLA en temps réel (décalage de hauteur + timbre séparés).
+// - La hauteur (pitch) est décalée en rejouant les "grains" de chaque période de la voix
+//   plus ou moins souvent : l'intonation naturelle (montées, descentes, micro-variations)
+//   est conservée, ce qui évite le côté robotique.
+// - Le timbre (formants) se règle à part en rééchantillonnant chaque grain : une voix
+//   féminine a un conduit vocal plus court, donc des formants ~15 % plus hauts.
+// - Les sons sans hauteur (s, f, ch, souffle) passent presque sans modification.
 #ifndef VS_DSP_H
 #define VS_DSP_H
 #include <math.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
 
-#define VS_BUF 8192             // taille du tampon circulaire (puissance de 2)
-#define VS_MASK (VS_BUF - 1)
+#define VS_N    16384
+#define VS_M    (VS_N - 1)
+#define VS_XD   4096
+#define VS_XDM  (VS_XD - 1)
+#define VS_MK   256
+#define VS_MKM  (VS_MK - 1)
+#define VS_LAGS 320
 
 typedef struct {
-    float buf[VS_BUF];
-    int   w;        // position d'écriture
-    float phase;    // phase du balayage, 0..1
-    float winLen;   // longueur de la fenêtre en échantillons
-    float ratio;    // rapport de hauteur courant (lissé)
-    int   inited;
+    float x[VS_N];      // entrée
+    float y[VS_N];      // sortie en cours d'accumulation (somme des grains fenêtrés)
+    float ws[VS_N];     // somme des fenêtres (pour normaliser)
+    float xd[VS_XD];    // entrée décimée (pour la détection de hauteur)
+    int64_t w;          // échantillons reçus
+    int64_t wd;         // échantillons décimés
+    float sr; int D;
+    int Dfix, Pdef, Pmin, Pmax, Hmax, LA;
+    int lagMin, lagMax, Wd;
+    float accum; int accn;
+    int64_t mpos[VS_MK]; float mP[VS_MK]; unsigned char mV[VS_MK]; int64_t nm;
+    int64_t cand; int candInit;
+    int64_t ts; int tsInit;
+    int64_t fin;        // les échantillons < fin sont définitifs
+    int64_t outDone;    // les échantillons < outDone ont déjà été émis
+    float ein, eout, gain;   // suivi de niveau pour garder le même volume qu'à l'entrée
 } VSPitch;
 
-static inline void vs_pitch_init(VSPitch *p, float sampleRate) {
+static inline void vs_pitch_init(VSPitch *p, float sr) {
     memset(p, 0, sizeof(*p));
-    float w = sampleRate * 0.034f;          // ~34 ms : bon compromis pour la voix
-    if (w < 256.f) w = 256.f;
-    if (w > 4096.f) w = 4096.f;
-    p->winLen = w;
-    p->ratio = 1.f;
-    p->inited = 1;
+    if (sr < 8000.f) sr = 8000.f;
+    p->sr = sr;
+    p->D = (int)(sr / 12000.f + 0.5f); if (p->D < 1) p->D = 1;
+    float sd = sr / (float)p->D;
+    p->lagMin = (int)(sd / 420.f); if (p->lagMin < 4) p->lagMin = 4;
+    p->lagMax = (int)(sd / 70.f);  if (p->lagMax > VS_LAGS - 3) p->lagMax = VS_LAGS - 3;
+    p->Wd   = (int)(p->lagMax * 1.5f);
+    p->Pmin = (int)(sr / 420.f);
+    p->Pmax = (int)(sr / 70.f);
+    p->Pdef = (int)(sr * 0.010f);
+    p->Hmax = (int)(sr * 0.021f) + 2;
+    p->LA   = (int)(sr * 0.016f);
+    p->Dfix = (int)(sr * 0.055f);          // latence fixe ~55 ms
+    p->gain = 1.f;
 }
 
-static inline float vs_win(float ph) {      // fenêtre de Hann, somme des 2 têtes = 1
-    float s = sinf(3.14159265f * ph);
-    return s * s;
-}
+static inline float vs_xat(const VSPitch *p, int64_t i) { return p->x[i & VS_M]; }
 
-static inline float vs_read(const VSPitch *p, float delay) {
-    float pos = (float)p->w - delay;
-    int   i0 = (int)floorf(pos);
-    float fr = pos - (float)i0;
-    float a = p->buf[i0 & VS_MASK];
-    float b = p->buf[(i0 + 1) & VS_MASK];
-    return a + (b - a) * fr;
-}
-
-// Traite n échantillons contigus. 'target' = rapport de hauteur voulu (2^(demitons/12)).
-static inline void vs_pitch_chunk(VSPitch *p, const float *in, float *out, int n, float target) {
-    float r  = p->ratio;
-    float dr = (target - r) / (float)(n > 0 ? n : 1);   // changement progressif, sans clic
-    float inv = 1.f / p->winLen;
-    for (int i = 0; i < n; i++) {
-        p->buf[p->w & VS_MASK] = in[i];
-        p->w++;
-        r += dr;
-        p->phase += (1.f - r) * inv;
-        if (p->phase >= 1.f) p->phase -= 1.f;
-        if (p->phase <  0.f) p->phase += 1.f;
-        float ph2 = p->phase + 0.5f; if (ph2 >= 1.f) ph2 -= 1.f;
-        float y = vs_read(p, p->phase * p->winLen) * vs_win(p->phase)
-                + vs_read(p, ph2      * p->winLen) * vs_win(ph2);
-        out[i] = y;
+// Détecte la période autour de la position m. Retourne 1 si voisé.
+static inline int vs_estimate(const VSPitch *p, int64_t m, float *per, float *conf) {
+    int64_t c = m / p->D;
+    int W = p->Wd, h = W / 2;
+    *conf = 0.f; *per = (float)p->Pdef;
+    if (c + h > p->wd - 1 || c - h - p->lagMax < 1) return 0;
+    double e0 = 0;
+    for (int n = -h; n < h; n++) { float v = p->xd[(c + n) & VS_XDM]; e0 += (double)v * v; }
+    if (e0 / W < 2e-6) return 0;                       // silence
+    float r[VS_LAGS]; float rmax = -1.f;
+    for (int t = p->lagMin - 1; t <= p->lagMax + 1; t++) {
+        double num = 0, et = 0;
+        for (int n = -h; n < h; n++) {
+            float a = p->xd[(c + n) & VS_XDM], b = p->xd[(c + n - t) & VS_XDM];
+            num += (double)a * b; et += (double)b * b;
+        }
+        float v = (float)(num / (sqrt(e0 * et) + 1e-9));
+        r[t] = v;
+        if (t >= p->lagMin && t <= p->lagMax && v > rmax) rmax = v;
     }
-    p->ratio = target;
+    int best = -1;
+    for (int t = p->lagMin; t <= p->lagMax; t++)       // plus petit pic proche du max (évite les erreurs d'octave)
+        if (r[t] >= 0.88f * rmax && r[t] >= r[t - 1] && r[t] >= r[t + 1]) { best = t; break; }
+    if (best < 0) return 0;
+    float a = r[best - 1], b = r[best], cc = r[best + 1];
+    float den = a - 2.f * b + cc, d = 0.f;
+    if (fabsf(den) > 1e-9f) d = 0.5f * (a - cc) / den;
+    if (d > 1.f) d = 1.f; if (d < -1.f) d = -1.f;
+    *per = ((float)best + d) * (float)p->D;
+    *conf = b;
+    return b > 0.5f;
+}
+
+// Pose des marques (une par période de voix) à mesure que l'entrée arrive.
+static inline void vs_gen_marks(VSPitch *p) {
+    for (;;) {
+        if (!p->candInit) { p->cand = 2 * (int64_t)p->Pmax; p->candInit = 1; }
+        if (p->w - p->cand < p->LA) return;
+        float per, conf;
+        int v = vs_estimate(p, p->cand, &per, &conf);
+        float P; int64_t pos = p->cand;
+        if (v) {
+            P = per; if (P < p->Pmin) P = (float)p->Pmin; if (P > p->Pmax) P = (float)p->Pmax;
+            int rad = (int)(P * 0.25f); float bv = -1.f; int64_t best = pos;
+            for (int64_t q = pos - rad; q <= pos + rad; q++) {
+                float s = 0.25f * (vs_xat(p, q - 1) + 2.f * vs_xat(p, q) + vs_xat(p, q + 1));
+                float a = fabsf(s);
+                if (a > bv) { bv = a; best = q; }
+            }
+            pos = best;
+        } else P = (float)p->Pdef;
+        int idx = (int)(p->nm & VS_MKM);
+        p->mpos[idx] = pos; p->mP[idx] = P; p->mV[idx] = (unsigned char)v; p->nm++;
+        p->cand = pos + (int64_t)lrintf(P);
+    }
+}
+
+static inline float vs_interp(const VSPitch *p, double pos) {      // interpolation cubique (Catmull-Rom)
+    int64_t i = (int64_t)floor(pos); float f = (float)(pos - (double)i);
+    float a = vs_xat(p, i - 1), b = vs_xat(p, i), c = vs_xat(p, i + 1), d = vs_xat(p, i + 2);
+    return b + 0.5f * f * (c - a + f * (2.f * a - 5.f * b + 4.f * c - d + f * (3.f * (b - c) + d - a)));
+}
+
+// Synthèse : place un grain par période de sortie. beta = rapport de hauteur, alpha = rapport de timbre.
+static inline void vs_synth(VSPitch *p, float beta, float alpha) {
+    for (;;) {
+        if (p->nm < 3) return;
+        if (!p->tsInit) { p->ts = p->mpos[1]; p->tsInit = 1; }
+        int64_t newest = p->mpos[(p->nm - 1) & VS_MKM];
+        if (newest < p->ts) return;
+        int64_t kk = p->nm - 1;
+        int64_t bestd = llabs(p->mpos[kk & VS_MKM] - p->ts);
+        for (int64_t j = p->nm - 2; j >= 0 && j >= p->nm - VS_MK; j--) {
+            int64_t mp = p->mpos[j & VS_MKM];
+            int64_t d = llabs(mp - p->ts);
+            if (d < bestd) { bestd = d; kk = j; }
+            else if (mp < p->ts) break;
+        }
+        int64_t m = p->mpos[kk & VS_MKM]; float P = p->mP[kk & VS_MKM]; int voiced = p->mV[kk & VS_MKM];
+        float be = voiced ? beta : 1.f, al = voiced ? alpha : 1.f;
+        int half = (int)lrintf(P / al); if (half < 8) half = 8; if (half > p->Hmax) half = p->Hmax;
+        int span = (int)ceilf((float)half * al) + 3;
+        if (p->w < m + span + 1) return;                  // pas encore assez d'entrée
+        int step = (int)lrintf(P / be); if (step < 8) step = 8;
+        for (int i = -half; i <= half; i++) {
+            int64_t o = p->ts + i;
+            if (o < p->outDone) continue;
+            float win = 0.5f * (1.f + cosf(3.14159265f * (float)i / (float)half));
+            float s = vs_interp(p, (double)m + (double)i * (double)al);
+            p->y[o & VS_M] += s * win; p->ws[o & VS_M] += win;
+        }
+        p->ts += step;
+        p->fin = p->ts - p->Hmax;
+    }
+}
+
+// Traite n échantillons contigus (entrée -> sortie, même taille, latence fixe ~55 ms).
+static inline void vs_pitch_chunk(VSPitch *p, const float *in, float *out, int n, float beta, float alpha) {
+    if (beta < 0.4f) beta = 0.4f; if (beta > 2.5f) beta = 2.5f;
+    if (alpha < 0.7f) alpha = 0.7f; if (alpha > 1.5f) alpha = 1.5f;
+    int64_t w0 = p->w;
+    for (int i = 0; i < n; i++) {
+        float s = in[i];
+        p->x[(w0 + i) & VS_M] = s;
+        p->accum += s;
+        if (++p->accn >= p->D) { p->xd[p->wd & VS_XDM] = p->accum / (float)p->D; p->wd++; p->accum = 0.f; p->accn = 0; }
+    }
+    p->w = w0 + n;
+    vs_gen_marks(p);
+    vs_synth(p, beta, alpha);
+    const float kE = 1.f / (0.05f * p->sr), kG = 1.f / (0.03f * p->sr);
+    for (int i = 0; i < n; i++) {
+        int64_t idx = w0 + i - p->Dfix;
+        if (idx < 0) { out[i] = 0.f; continue; }
+        float v;
+        if (idx < p->fin) {
+            float ws = p->ws[idx & VS_M], yv = p->y[idx & VS_M];
+            v = ws > 0.05f ? yv / ws : p->x[idx & VS_M];
+        } else v = p->x[idx & VS_M];                       // sous-alimentation : voix d'origine
+        p->y[idx & VS_M] = 0.f; p->ws[idx & VS_M] = 0.f;
+        p->outDone = idx + 1;
+        // même volume que la voix d'origine (comparaison avec l'entrée retardée, donc alignée)
+        float xi = p->x[idx & VS_M];
+        p->ein  += (xi * xi - p->ein)  * kE;
+        p->eout += (v  * v  - p->eout) * kE;
+        float gt = sqrtf((p->ein + 1e-9f) / (p->eout + 1e-9f));
+        if (gt > 2.5f) gt = 2.5f; if (gt < 0.4f) gt = 0.4f;
+        p->gain += (gt - p->gain) * kG;
+        v *= p->gain;
+        out[i] = v > 1.f ? 1.f : (v < -1.f ? -1.f : v);
+    }
 }
 #endif
