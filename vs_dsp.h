@@ -6,7 +6,7 @@
 #include <math.h>
 #include <string.h>
 
-#define VS_BUF 16384            // taille du tampon circulaire (puissance de 2)
+#define VS_BUF 8192             // taille du tampon circulaire (puissance de 2)
 #define VS_MASK (VS_BUF - 1)
 
 typedef struct {
@@ -22,7 +22,7 @@ static inline void vs_pitch_init(VSPitch *p, float sampleRate) {
     memset(p, 0, sizeof(*p));
     float w = sampleRate * 0.034f;          // ~34 ms : bon compromis pour la voix
     if (w < 256.f) w = 256.f;
-    if (w > 8192.f) w = 8192.f;
+    if (w > 4096.f) w = 4096.f;
     p->winLen = w;
     p->ratio = 1.f;
     p->inited = 1;
