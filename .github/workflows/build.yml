@@ -1,0 +1,22 @@
+name: Build VoiceShift
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installer les outils
+        run: |
+          brew install ldid dpkg make
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          git clone --depth=1 https://github.com/theos/sdks.git /tmp/sdks
+          cp -R /tmp/sdks/*.sdk $HOME/theos/sdks/
+      - name: Compiler le .deb
+        run: |
+          export THEOS=$HOME/theos
+          export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
+          make package FINALPACKAGE=1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoiceShift-deb
+          path: packages/*.deb
