@@ -1,4 +1,4 @@
-// VoiceShift 0.6.0 — changeur de voix micro avec bouton flottant.
+// VoiceShift 0.7.0 — changeur de voix micro avec bouton flottant.
 #import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <AVFoundation/AVFoundation.h>
@@ -10,18 +10,21 @@
 #include <time.h>
 #include <stdio.h>
 #include "vs_dsp.h"
+#ifdef VS_STRETCH
+#include "signalsmith-stretch.h"      // bibliothèque open source (MIT) : décalage de hauteur et de formants de haute qualité
+#endif
 
 // ───────────── Réglages partagés entre toutes les apps ─────────────
-// Défaut : activé, hauteur +6 demi-tons, timbre +2,5 (voix grave -> voix féminine naturelle).
+// Défaut : activé, hauteur +8 demi-tons, timbre +3 (voix grave -> voix féminine naturelle).
 static volatile int   g_enabled = 1;
-static volatile float g_semi    = 6.0f;     // hauteur de la voix (demi-tons)
-static volatile float g_form    = 2.5f;     // timbre / formants (demi-tons)
+static volatile float g_semi    = 8.0f;     // hauteur de la voix (demi-tons)
+static volatile float g_form    = 3.0f;     // timbre / formants (demi-tons)
 static int  g_token = 0;
 static BOOL g_isSpringBoard = NO;
 static const char *kNote = "com.local.voiceshift.changed";
 static const char *kConf[] = {
-    "/var/jb/var/mobile/Library/Preferences/voiceshift.v4.conf",
-    "/var/mobile/Library/Preferences/voiceshift.v4.conf" };
+    "/var/jb/var/mobile/Library/Preferences/voiceshift.v5.conf",
+    "/var/mobile/Library/Preferences/voiceshift.v5.conf" };
 
 static void vs_apply(int en, float semi, float form) {
     if (semi < -12.f) semi = -12.f;
@@ -67,9 +70,38 @@ static void vs_push_state(void) {         // publie vers toutes les apps
     notify_post(kNote);
 }
 
+// ───────────── Moteur de transformation de la voix ─────────────
+#ifdef VS_STRETCH
+struct VSEngine {
+    signalsmith::stretch::SignalsmithStretch<float> st;
+    float lastSemi = -999.f, lastForm = -999.f;
+};
+static VSEngine *eng_new(float sr) {
+    VSEngine *e = new VSEngine();
+    e->st.presetDefault(1, sr, true);              // bloc 120 ms, calcul réparti pour le temps réel
+    e->st.setFormantBase(130.f / sr);              // fondamentale moyenne d'une voix grave (relative à la fréquence d'échantillonnage)
+    return e;
+}
+static void eng_free(VSEngine *e) { delete e; }
+static void eng_chunk(VSEngine *e, const float *in, float *out, int n, float semi, float form) {
+    if (semi != e->lastSemi) { e->st.setTransposeSemitones(semi); e->lastSemi = semi; }
+    if (form != e->lastForm) { e->st.setFormantSemitones(form, true); e->lastForm = form; }   // timbre indépendant de la hauteur
+    float *ib[1] = { const_cast<float *>(in) };
+    float *ob[1] = { out };
+    e->st.process(ib, n, ob, n);
+}
+#else
+typedef VSPitch VSEngine;                           // repli : PSOLA maison (vs_dsp.h)
+static VSEngine *eng_new(float sr) { VSEngine *e = (VSEngine *)malloc(sizeof(VSEngine)); vs_pitch_init(e, sr); return e; }
+static void eng_free(VSEngine *e) { free(e); }
+static void eng_chunk(VSEngine *e, const float *in, float *out, int n, float semi, float form) {
+    vs_pitch_chunk(e, in, out, n, exp2f(semi / 12.f), exp2f(form / 12.f));
+}
+#endif
+
 // ───────────── Traitement audio ─────────────
 #define MAXSLOTS 16
-typedef struct { void *key; int ch; VSPitch p; } Slot;
+typedef struct { void *key; int ch; VSEngine *p; } Slot;
 typedef struct { void *unit; int kind; float sr; } UnitInfo;   // kind: 1=float32, 2=s16, 0=non géré
 static Slot     g_slots[MAXSLOTS];  static int g_nslots = 0, g_evict = 0;
 static UnitInfo g_units[MAXSLOTS];  static int g_nunits = 0;
@@ -85,28 +117,28 @@ static BOOL vs_claim(int src) {
     return NO;
 }
 
-static VSPitch *slot_for(void *key, int ch, float sr) {
+static VSEngine *slot_for(void *key, int ch, float sr) {
     int n = g_nslots;
-    for (int i = 0; i < n; i++) if (g_slots[i].key == key && g_slots[i].ch == ch) return &g_slots[i].p;
+    for (int i = 0; i < n; i++) if (g_slots[i].key == key && g_slots[i].ch == ch) return g_slots[i].p;
     pthread_mutex_lock(&g_mx);
-    for (int i = 0; i < g_nslots; i++) if (g_slots[i].key == key && g_slots[i].ch == ch) { pthread_mutex_unlock(&g_mx); return &g_slots[i].p; }
+    for (int i = 0; i < g_nslots; i++) if (g_slots[i].key == key && g_slots[i].ch == ch) { pthread_mutex_unlock(&g_mx); return g_slots[i].p; }
     Slot *s;
     if (g_nslots < MAXSLOTS) { s = &g_slots[g_nslots]; }
     else { s = &g_slots[g_evict++ % MAXSLOTS]; }          // plein : on recycle le plus ancien
-    s->key = key; s->ch = ch; vs_pitch_init(&s->p, sr);
+    if (s->p) { eng_free(s->p); s->p = NULL; }
+    s->key = key; s->ch = ch; s->p = eng_new(sr);
     __sync_synchronize();
     if (g_nslots < MAXSLOTS && s == &g_slots[g_nslots]) g_nslots++;
     pthread_mutex_unlock(&g_mx);
-    return &s->p;
+    return s->p;
 }
 
 // Traite un canal : kind 1 = float32, 2 = int16 ; stride en échantillons
 static void vs_process_channel(void *key, int ch, float sr, int kind, void *base, int frames, int stride) {
     float semi = g_semi, form = g_form;
     if (!g_enabled || (fabsf(semi) < 0.05f && fabsf(form) < 0.05f) || !base || frames <= 0 || stride <= 0) return;
-    VSPitch *p = slot_for(key, ch, sr);
+    VSEngine *p = slot_for(key, ch, sr);
     if (!p) return;
-    float target = exp2f(semi / 12.f), alpha = exp2f(form / 12.f);
     float in[512], out[512];
     int done = 0;
     while (done < frames) {
@@ -114,12 +146,12 @@ static void vs_process_channel(void *key, int ch, float sr, int kind, void *base
         if (kind == 1) {
             float *d = (float *)base + (size_t)done * stride;
             for (int i = 0; i < n; i++) in[i] = d[(size_t)i * stride];
-            vs_pitch_chunk(p, in, out, n, target, alpha);
+            eng_chunk(p, in, out, n, semi, form);
             for (int i = 0; i < n; i++) { float v = out[i]; d[(size_t)i * stride] = v > 1.f ? 1.f : (v < -1.f ? -1.f : v); }
         } else {
             int16_t *d = (int16_t *)base + (size_t)done * stride;
             for (int i = 0; i < n; i++) in[i] = d[(size_t)i * stride] * (1.f / 32768.f);
-            vs_pitch_chunk(p, in, out, n, target, alpha);
+            eng_chunk(p, in, out, n, semi, form);
             for (int i = 0; i < n; i++) {
                 float v = out[i] * 32768.f; v = v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v);
                 d[(size_t)i * stride] = (int16_t)v;
@@ -480,8 +512,8 @@ static VSRootVC *g_vc = nil;
 }
 - (void)slDone:(UISlider *)s { if (g_isSpringBoard) vs_save_file(); }
 - (void)preset:(UIButton *)b {
-    float v  = b.tag == 0 ?  6.f : (b.tag == 1 ? -6.f : 0.f);
-    float fm = b.tag == 0 ? 2.5f : (b.tag == 1 ? -2.5f : 0.f);
+    float v  = b.tag == 0 ?  8.f : (b.tag == 1 ? -8.f : 0.f);
+    float fm = b.tag == 0 ? 3.f : (b.tag == 1 ? -3.f : 0.f);
     vs_apply(1, v, fm); vs_push_state(); [self refreshFromState]; if (g_isSpringBoard) vs_save_file();
 }
 @end
