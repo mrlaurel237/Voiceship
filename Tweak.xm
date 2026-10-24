@@ -1,4 +1,4 @@
-// VoiceShift 0.5.0 — changeur de voix micro avec bouton flottant.
+// VoiceShift 0.6.0 — changeur de voix micro avec bouton flottant.
 #import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <AVFoundation/AVFoundation.h>
@@ -7,6 +7,7 @@
 #import <notify.h>
 #include <substrate.h>
 #include <pthread.h>
+#include <time.h>
 #include <stdio.h>
 #include "vs_dsp.h"
 
@@ -75,6 +76,14 @@ static UnitInfo g_units[MAXSLOTS];  static int g_nunits = 0;
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 // compteurs de diagnostic : 0=AudioUnit 1=AudioQueue 2=Capture 3=Tap AVAudioEngine
 static volatile uint32_t g_cnt[4] = {0, 0, 0, 0};
+// un seul chemin audio traite le micro à la fois (évite de décaler la voix deux fois)
+static volatile int g_owner = -1; static volatile uint64_t g_ownerT = 0;
+static BOOL vs_claim(int src) {
+    uint64_t t = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    int o = g_owner;
+    if (o == src || o < 0 || t - g_ownerT > 1000000000ULL) { g_owner = src; g_ownerT = t; return YES; }
+    return NO;
+}
 
 static VSPitch *slot_for(void *key, int ch, float sr) {
     int n = g_nslots;
@@ -127,7 +136,7 @@ static void vs_process_asbd(void *key, const AudioStreamBasicDescription *a, voi
     int kind = 0;
     if ((a->mFormatFlags & kAudioFormatFlagIsFloat) && a->mBitsPerChannel == 32) kind = 1;
     else if (!(a->mFormatFlags & kAudioFormatFlagIsFloat) && a->mBitsPerChannel == 16) kind = 2;
-    if (!kind) return;
+    if (!kind || !vs_claim(src)) return;
     int nch = a->mChannelsPerFrame ? (int)a->mChannelsPerFrame : 1;
     int bps = (kind == 1) ? 4 : 2;
     int frames = (int)(bytes / (UInt32)(bps * nch));
@@ -166,7 +175,7 @@ static OSStatus hook_render(AudioUnit unit, AudioUnitRenderActionFlags *flags, c
     OSStatus r = orig_render(unit, flags, ts, bus, frames, io);
     if (r != noErr || bus != 1 || !io) return r;                    // bus 1 = micro
     g_cnt[0]++;
-    if (!g_enabled) return r;
+    if (!g_enabled || !vs_claim(0)) return r;
     UnitInfo *ui = unit_info(unit);
     if (!ui || !ui->kind) return r;
     for (UInt32 b = 0; b < io->mNumberBuffers; b++) {
@@ -274,7 +283,7 @@ static void vs_setdel_imp(id self, SEL _cmd, id delegate, dispatch_queue_t q) {
 // ── 4) AVAudioEngine : tap sur le micro (inputNode) ──
 static void vs_process_pcmbuffer(void *key, AVAudioPCMBuffer *buf) {
     g_cnt[3]++;
-    if (!g_enabled) return;
+    if (!g_enabled || !vs_claim(3)) return;
     int n = (int)buf.frameLength, nch = (int)buf.format.channelCount, st = (int)buf.stride;
     float sr = (float)buf.format.sampleRate;
     if (buf.floatChannelData) {
@@ -438,8 +447,10 @@ static VSRootVC *g_vc = nil;
     self.fab.alpha = g_enabled ? 0.92 : 0.45;
 }
 - (void)updateDiag {
-    self.diag.text = [NSString stringWithFormat:@"Audio micro vu dans cette app :\nAU %u · AQ %u · Cap %u · Tap %u",
-                      g_cnt[0], g_cnt[1], g_cnt[2], g_cnt[3]];
+    static const char *nm[] = {"AU", "AQ", "Cap", "Tap"};
+    int o = g_owner;
+    self.diag.text = [NSString stringWithFormat:@"Micro vu : AU %u · AQ %u · Cap %u · Tap %u\nChemin actif : %s",
+                      g_cnt[0], g_cnt[1], g_cnt[2], g_cnt[3], (o >= 0 && o < 4) ? nm[o] : "aucun"];
 }
 - (void)togglePanel {
     self.panel.hidden = !self.panel.hidden;

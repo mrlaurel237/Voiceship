@@ -37,6 +37,9 @@ typedef struct {
     int64_t fin;        // les échantillons < fin sont définitifs
     int64_t outDone;    // les échantillons < outDone ont déjà été émis
     float ein, eout, gain;   // suivi de niveau pour garder le même volume qu'à l'entrée
+    float prevP; int prevV; int vstate;   // mémoire de la hauteur (lissage, anti erreurs d'octave)
+    uint32_t rng; int64_t lastK; int flip;
+    int64_t underruns;       // diagnostic : échantillons sortis sans traitement
 } VSPitch;
 
 static inline void vs_pitch_init(VSPitch *p, float sr) {
@@ -54,13 +57,13 @@ static inline void vs_pitch_init(VSPitch *p, float sr) {
     p->Hmax = (int)(sr * 0.021f) + 2;
     p->LA   = (int)(sr * 0.016f);
     p->Dfix = (int)(sr * 0.055f);          // latence fixe ~55 ms
-    p->gain = 1.f;
+    p->gain = 1.f; p->rng = 2463534242u; p->lastK = -1;
 }
 
 static inline float vs_xat(const VSPitch *p, int64_t i) { return p->x[i & VS_M]; }
 
 // Détecte la période autour de la position m. Retourne 1 si voisé.
-static inline int vs_estimate(const VSPitch *p, int64_t m, float *per, float *conf) {
+static inline int vs_estimate(const VSPitch *p, int64_t m, float *per, float *conf, float thr) {
     int64_t c = m / p->D;
     int W = p->Wd, h = W / 2;
     *conf = 0.f; *per = (float)p->Pdef;
@@ -89,7 +92,7 @@ static inline int vs_estimate(const VSPitch *p, int64_t m, float *per, float *co
     if (d > 1.f) d = 1.f; if (d < -1.f) d = -1.f;
     *per = ((float)best + d) * (float)p->D;
     *conf = b;
-    return b > 0.5f;
+    return b > thr;
 }
 
 // Pose des marques (une par période de voix) à mesure que l'entrée arrive.
@@ -98,18 +101,46 @@ static inline void vs_gen_marks(VSPitch *p) {
         if (!p->candInit) { p->cand = 2 * (int64_t)p->Pmax; p->candInit = 1; }
         if (p->w - p->cand < p->LA) return;
         float per, conf;
-        int v = vs_estimate(p, p->cand, &per, &conf);
+        int v = vs_estimate(p, p->cand, &per, &conf, p->vstate ? 0.35f : 0.5f);   // hystérésis voisé/non voisé
+        p->vstate = v;
         float P; int64_t pos = p->cand;
         if (v) {
-            P = per; if (P < p->Pmin) P = (float)p->Pmin; if (P > p->Pmax) P = (float)p->Pmax;
-            int rad = (int)(P * 0.25f); float bv = -1.f; int64_t best = pos;
-            for (int64_t q = pos - rad; q <= pos + rad; q++) {
-                float s = 0.25f * (vs_xat(p, q - 1) + 2.f * vs_xat(p, q) + vs_xat(p, q + 1));
-                float a = fabsf(s);
-                if (a > bv) { bv = a; best = q; }
+            P = per;
+            if (p->prevV && p->prevP > 0.f) {
+                float ra = P / p->prevP;
+                if (ra > 1.8f && ra < 2.2f) P *= 0.5f;           // erreurs d'octave
+                else if (ra > 0.45f && ra < 0.55f) P *= 2.f;
+                ra = P / p->prevP;
+                if (ra > 0.7f && ra < 1.43f) P = 0.5f * P + 0.5f * p->prevP;   // lissage : moins de tremblement
+            }
+            if (P < p->Pmin) P = (float)p->Pmin; if (P > p->Pmax) P = (float)p->Pmax;
+            int rad = (int)(P * 0.25f);
+            int64_t best = pos;
+            if (p->prevV && p->nm > 0) {
+                // alignement par ressemblance de forme d'onde avec la période précédente
+                int64_t mp = p->mpos[(p->nm - 1) & VS_MKM];
+                int Wn = (int)(P * 0.5f), R = (int)(P * 0.2f);
+                double er = 0;
+                for (int n = -Wn; n <= Wn; n++) { float b = vs_xat(p, mp + n); er += (double)b * b; }
+                double bc = -2.0;
+                for (int sh = -R; sh <= R; sh++) {
+                    double num = 0, ec = 0;
+                    for (int n = -Wn; n <= Wn; n++) { float a = vs_xat(p, pos + sh + n), b = vs_xat(p, mp + n); num += (double)a * b; ec += (double)a * a; }
+                    double c = num / sqrt(er * ec + 1e-12);
+                    if (c > bc) { bc = c; best = pos + sh; }
+                }
+            } else {
+                float bv = -1.f;
+                for (int64_t q = pos - rad; q <= pos + rad; q++) {
+                    float sm = 0.25f * (vs_xat(p, q - 1) + 2.f * vs_xat(p, q) + vs_xat(p, q + 1));
+                    float a = fabsf(sm);
+                    if (a > bv) { bv = a; best = q; }
+                }
             }
             pos = best;
+            p->prevP = P;
         } else P = (float)p->Pdef;
+        p->prevV = v;
         int idx = (int)(p->nm & VS_MKM);
         p->mpos[idx] = pos; p->mP[idx] = P; p->mV[idx] = (unsigned char)v; p->nm++;
         p->cand = pos + (int64_t)lrintf(P);
@@ -137,12 +168,20 @@ static inline void vs_synth(VSPitch *p, float beta, float alpha) {
             if (d < bestd) { bestd = d; kk = j; }
             else if (mp < p->ts) break;
         }
+        if (kk == p->lastK) {                              // ne jamais rejouer exactement le même grain (sinon bourdonnement)
+            int64_t alt = p->flip ? kk - 1 : kk + 1; p->flip ^= 1;
+            if (alt >= 0 && alt < p->nm && alt >= p->nm - VS_MK + 2) kk = alt;
+        }
         int64_t m = p->mpos[kk & VS_MKM]; float P = p->mP[kk & VS_MKM]; int voiced = p->mV[kk & VS_MKM];
         float be = voiced ? beta : 1.f, al = voiced ? alpha : 1.f;
         int half = (int)lrintf(P / al); if (half < 8) half = 8; if (half > p->Hmax) half = p->Hmax;
         int span = (int)ceilf((float)half * al) + 3;
         if (p->w < m + span + 1) return;                  // pas encore assez d'entrée
-        int step = (int)lrintf(P / be); if (step < 8) step = 8;
+        p->rng ^= p->rng << 13; p->rng ^= p->rng >> 17; p->rng ^= p->rng << 5;
+        float rnd = ((float)(p->rng & 0xFFFF) / 32768.f) - 1.f;           // -1..1
+        float jit = voiced ? 1.f + 0.010f * rnd : 1.f;                     // petites variations naturelles
+        int step = (int)lrintf(P / be * jit); if (step < 8) step = 8;
+        p->lastK = kk;
         for (int i = -half; i <= half; i++) {
             int64_t o = p->ts + i;
             if (o < p->outDone) continue;
@@ -177,7 +216,7 @@ static inline void vs_pitch_chunk(VSPitch *p, const float *in, float *out, int n
         if (idx < p->fin) {
             float ws = p->ws[idx & VS_M], yv = p->y[idx & VS_M];
             v = ws > 0.05f ? yv / ws : p->x[idx & VS_M];
-        } else v = p->x[idx & VS_M];                       // sous-alimentation : voix d'origine
+        } else { v = p->x[idx & VS_M]; p->underruns++; }   // sous-alimentation : voix d'origine
         p->y[idx & VS_M] = 0.f; p->ws[idx & VS_M] = 0.f;
         p->outDone = idx + 1;
         // même volume que la voix d'origine (comparaison avec l'entrée retardée, donc alignée)
