@@ -1,0 +1,9 @@
+Package: com.local.voiceshift
+Name: VoiceShift
+Version: 0.3.0
+Architecture: iphoneos-arm64
+Depends: firmware (>= 15.0), ellekit | mobilesubstrate
+Description: Changeur de voix micro (bouton flottant, curseur, on/off)
+Maintainer: test
+Author: test
+Section: Tweaks
