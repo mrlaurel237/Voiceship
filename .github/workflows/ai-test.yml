@@ -9,9 +9,14 @@ jobs:
         with:
           python-version: '3.10'
       - name: Installer
-        run: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          pip install "numpy<2"
+          pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cpu
       - name: Preparer les audios
         run: |
+          ls
           mkdir -p work
           i=0
           for f in ref*; do i=$((i+1)); ffmpeg -y -loglevel error -i "$f" -ar 16000 -ac 1 work/ref$i.wav; done
