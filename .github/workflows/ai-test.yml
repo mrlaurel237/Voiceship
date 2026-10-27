@@ -3,6 +3,9 @@ on: workflow_dispatch
 jobs:
   convert:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -10,21 +13,17 @@ jobs:
           python-version: '3.10'
       - name: Installer
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          pip install "numpy<2"
-          pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cpu
+          (sudo apt-get update && sudo apt-get install -y ffmpeg && pip install "numpy<2" && pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cpu) 2>&1 | tee 1install.log
       - name: Preparer les audios
         run: |
-          ls
-          mkdir -p work
+          (ls; mkdir -p work
           i=0
           for f in ref*; do i=$((i+1)); ffmpeg -y -loglevel error -i "$f" -ar 16000 -ac 1 work/ref$i.wav; done
           f=$(ls me.* | head -1)
-          ffmpeg -y -loglevel error -i "$f" -ar 16000 -ac 1 work/me.wav
+          ffmpeg -y -loglevel error -i "$f" -ar 16000 -ac 1 work/me.wav) 2>&1 | tee 2prep.log
       - name: Convertir
         run: |
-          python - <<'EOF'
+          python - <<'EOF' 2>&1 | tee 3conv.log
           import torch, torchaudio, glob
           knn = torch.hub.load('bshall/knn-vc', 'knn_vc', prematched=True, trust_repo=True, pretrained=True, device='cpu')
           ms = knn.get_matching_set(sorted(glob.glob('work/ref*.wav')))
@@ -33,6 +32,11 @@ jobs:
               out = knn.match(q, ms, topk=k)
               torchaudio.save('out_k%d.wav' % k, out[None], 16000)
           EOF
+      - name: Afficher l erreur
+        if: failure()
+        run: |
+          f=$(ls -t *.log | head -1)
+          echo "::error title=$f::$(tail -n 12 $f | tr '\n' ' ' | cut -c1-900)"
       - uses: actions/upload-artifact@v4
         with:
           name: voix-convertie
