@@ -13,7 +13,7 @@ jobs:
           python-version: '3.10'
       - name: Installer
         run: |
-          (sudo apt-get update && sudo apt-get install -y ffmpeg && pip install "numpy<2" && pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cpu) 2>&1 | tee 1install.log
+          (sudo apt-get update && sudo apt-get install -y ffmpeg libsndfile1 && pip install "numpy<2" soundfile && pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cpu) 2>&1 | tee 1install.log
       - name: Preparer les audios
         run: |
           (ls; mkdir -p work
@@ -24,13 +24,13 @@ jobs:
       - name: Convertir
         run: |
           python - <<'EOF' 2>&1 | tee 3conv.log
-          import torch, torchaudio, glob
+          import torch, torchaudio, glob, soundfile as sf
           knn = torch.hub.load('bshall/knn-vc', 'knn_vc', prematched=True, trust_repo=True, pretrained=True, device='cpu')
           ms = knn.get_matching_set(sorted(glob.glob('work/ref*.wav')))
           q = knn.get_features('work/me.wav')
           for k in (4, 8):
               out = knn.match(q, ms, topk=k)
-              torchaudio.save('out_k%d.wav' % k, out[None], 16000)
+              sf.write('out_k%d.wav' % k, out.numpy(), 16000)
           EOF
       - name: Afficher l erreur
         if: failure()
