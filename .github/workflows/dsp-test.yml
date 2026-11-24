@@ -1,0 +1,20 @@
+name: Test moteur Naturel
+on:
+  push:
+    paths: ['src/dsp/**', 'tools/**', '.github/workflows/dsp-test.yml']
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compiler (avec détecteurs d'erreurs mémoire)
+        run: gcc -O1 -g -std=gnu11 -DVS_OFFLINE_TEST -fsanitize=address,undefined -fno-sanitize-recover=all -o vt tools/offline_test.c src/dsp/vs_natural.c -lm
+      - name: Tester toutes les fréquences d'échantillonnage
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          for sr in 8000 16000 24000 44100 48000; do
+            ffmpeg -y -loglevel error -i me.mp3.m4a -t 15 -ac 1 -ar $sr -f f32le in.f32
+            ASAN_OPTIONS=detect_leaks=0 ./vt in.f32 out.f32 $sr 480 12 17 0.2 | tee r.txt
+            python3 -c "import sys,array; a=array.array('f'); a.frombytes(open('out.f32','rb').read()); bad=[v for v in a if v!=v or abs(v)>1.0]; sys.exit(1 if bad else 0)"
+          done
