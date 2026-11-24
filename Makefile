@@ -13,7 +13,7 @@ VoiceShift_FILES = Tweak.xm \
 	src/VSState.m src/VSEngine.mm src/VSPanel.m src/VSTest.m \
 	src/license/VSLicense.m src/ai/VSAIEngine.m \
 	src/dsp/vs_natural.c
-VoiceShift_FRAMEWORKS = UIKit AudioToolbox AVFoundation CoreMedia Accelerate
+VoiceShift_FRAMEWORKS = UIKit AudioToolbox AVFoundation CoreMedia Accelerate CoreML
 VoiceShift_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -I$(CURDIR)/src -O3
 VoiceShift_OBJCXXFLAGS = -std=c++17
 

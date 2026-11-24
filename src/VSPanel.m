@@ -23,7 +23,8 @@ static UIColor *vsCard(void)   { return [UIColor colorWithWhite:0.2 alpha:1]; }
 @property (nonatomic, strong) UILabel *engineInfo, *lSemi, *lForm, *lBreath, *lSmooth, *lVib, *lExpr, *testInfo, *stats, *diag, *licLabel;
 @property (nonatomic, strong) UISlider *sSemi, *sForm, *sBreath, *sSmooth, *sVib, *sExpr;
 @property (nonatomic, strong) NSArray<UIButton *> *presetBtns;
-@property (nonatomic, strong) UIButton *fastModeBtn, *recBtn, *aBtn, *bBtn, *retryBtn;
+@property (nonatomic, strong) UIButton *fastModeBtn, *recBtn, *aBtn, *bBtn, *retryBtn, *aiBtn;
+@property (nonatomic, strong) UILabel *aiInfo;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic) CGFloat y;
 - (void)refreshFromState;
@@ -138,7 +139,10 @@ static const CGFloat W = 300, PAD = 14;
     [self.engineSeg addTarget:self action:@selector(engineChanged:) forControlEvents:UIControlEventValueChanged];
     [self.scroll addSubview:self.engineSeg];
     self.y += 36;
-    self.engineInfo = [self label:@"" size:11 color:[UIColor colorWithWhite:0.75 alpha:1] lines:3];
+    self.engineInfo = [self label:@"" size:11 color:[UIColor colorWithWhite:0.75 alpha:1] lines:4];
+    self.aiBtn = [self button:@"Mesurer l'IA sur cet iPhone" frame:CGRectMake(PAD, self.y, W - 2 * PAD, 30) action:@selector(aiBenchTap)];
+    self.y += 34;
+    self.aiInfo = [self label:@"" size:10 color:[UIColor colorWithWhite:0.75 alpha:1] lines:5];
 
     // ── préréglages ──
     [self section:@"VOIX FÉMININE — PRÉRÉGLAGES"];
@@ -349,6 +353,12 @@ static const CGFloat W = 300, PAD = 14;
 - (void)aTap { [VSTester.shared playOriginal]; }
 - (void)bTap { [VSTester.shared playProcessed]; }
 - (void)retryTap { vs_engine_retry(); [self refreshStats]; }
+- (void)aiBenchTap {
+    self.aiBtn.enabled = NO;
+    self.aiInfo.text = @"Mesure en cours (≈ 10 s)… ne parle pas, rien n'est enregistré.";
+    __weak typeof(self) ws = self;
+    vs_ai_benchmark(^(NSString *report) { ws.aiInfo.text = report; ws.aiBtn.enabled = YES; });
+}
 @end
 
 void vs_panel_show(void) {
