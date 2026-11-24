@@ -1,6 +1,6 @@
 Package: com.local.voiceshift
 Name: VoiceShift
-Version: 0.9.2
+Version: 0.9.3
 Architecture: iphoneos-arm64
 Depends: firmware (>= 15.0), ellekit | mobilesubstrate
 Description: Changeur de voix micro : moteur Naturel (source-filtre, formants, souffle), Rapide et IA (experimental), mode test A/B

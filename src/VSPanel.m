@@ -8,6 +8,9 @@
 #include "ai/VSAIEngine.h"
 #include "license/VSLicense.h"
 
+// Les textes C sont en UTF-8 : %s les afficherait mal (« P√©tillante »). On passe par NSString.
+static inline NSString *U(const char *s) { return (s ? [NSString stringWithUTF8String:s] : nil) ?: @""; }
+
 extern volatile uint32_t g_vsCnt[4];
 extern volatile int g_vsOwner;
 
@@ -149,7 +152,7 @@ static const CGFloat W = 300, PAD = 14;
     self.engineInfo = [self label:@"" size:11 color:[UIColor colorWithWhite:0.75 alpha:1] lines:4];
     self.aiBtn = [self button:@"Mesurer l'IA sur cet iPhone" frame:CGRectMake(PAD, self.y, W - 2 * PAD, 30) action:@selector(aiBenchTap)];
     self.y += 34;
-    self.aiInfo = [self label:@"" size:10 color:[UIColor colorWithWhite:0.75 alpha:1] lines:5];
+    self.aiInfo = [self label:@"" size:10 color:[UIColor colorWithWhite:0.75 alpha:1] lines:8];
 
     // ── préréglages ──
     [self section:@"VOIX FÉMININE — PRÉRÉGLAGES"];
@@ -158,7 +161,7 @@ static const CGFloat W = 300, PAD = 14;
     NSMutableArray *pb = [NSMutableArray new];
     CGFloat bw = (W - 2 * PAD - 16) / 3.f;
     for (int i = 0; i < VS_NPRESETS; i++) {
-        NSString *ti = [NSString stringWithFormat:@"%s\n%+.0f · %+.0f %%", kVSPresets[i].name, kVSPresets[i].semitones, kVSPresets[i].formantPct];
+        NSString *ti = [NSString stringWithFormat:@"%@\n%+.0f · %+.0f %%", U(kVSPresets[i].name), kVSPresets[i].semitones, kVSPresets[i].formantPct];
         UIButton *b = [self button:ti frame:CGRectMake(PAD + i * (bw + 8), self.y, bw, 46) action:@selector(preset:)];
         b.tag = i + 1;
         [pb addObject:b];
@@ -300,7 +303,7 @@ static const CGFloat W = 300, PAD = 14;
     self.fab.backgroundColor = s.enabled ? [vsAccent() colorWithAlphaComponent:0.75] : [UIColor colorWithWhite:0.0 alpha:0.75];
     self.favBtn.backgroundColor = (s.engine == VS_ENGINE_FAST && s.preset == 1) ? vsAccent() : vsCard();
     const char *lic = vs_license_label();
-    self.licLabel.text = lic[0] ? [NSString stringWithUTF8String:lic] : @"";
+    self.licLabel.text = U(lic);
     [self refreshStats];
 }
 
@@ -318,18 +321,18 @@ static const CGFloat W = 300, PAD = 14;
     static NSString *req[3] = {@"Rapide", @"Naturel", @"IA"};
     NSMutableString *info = [NSMutableString new];
     if (s.engine == VS_ENGINE_FAST)
-        [info appendString:@"Rapide : moteur de la 0.8 (latence ≈ 150 ms, son plus métallique)."];
+        [info appendString:@"Rapide : moteur Signalsmith (ton préféré avec Douce). Latence ≈ 150 ms."];
     else if (s.engine == VS_ENGINE_NATURAL)
         [info appendString:@"Naturel : source-filtre (hauteur, formants et souffle séparés). Latence ≈ 33 ms."];
     else
-        [info appendFormat:@"%s", vs_ai_status_text()];
+        [info appendString:U(vs_ai_status_text())];
     if (st.running >= 0 && st.running != VS_RUN_FAILSAFE && st.buffers > 0 &&
         !((s.engine == VS_ENGINE_FAST && st.running == VS_RUN_FAST) || (s.engine == VS_ENGINE_NATURAL && st.running == VS_RUN_NATURAL)))
-        [info appendFormat:@"\n→ en ce moment : %s", vs_engine_run_name(st.running)];
+        [info appendFormat:@"\n→ en ce moment : %@", U(vs_engine_run_name(st.running))];
     if (st.running == VS_RUN_FAILSAFE)
         [info appendFormat:@"\n⚠ Mode sécurité (%@)", s.failSilence ? @"micro coupé" : @"voix d'origine"];
     const char *why = vs_engine_reason_text(st.reason);
-    if (why[0]) [info appendFormat:@"\n⚠ %s", why];
+    if (why[0]) [info appendFormat:@"\n⚠ %@", U(why)];
     self.engineInfo.text = info;
     self.retryBtn.hidden = !(st.reason == VS_REASON_OVERLOAD || st.reason == VS_REASON_CRASH ||
                              st.reason == VS_REASON_CRASH_BEFORE || st.reason == VS_REASON_CREATE_FAILED);
@@ -337,12 +340,12 @@ static const CGFloat W = 300, PAD = 14;
     AVAudioSession *as = AVAudioSession.sharedInstance;
     float io = (float)((as.inputLatency + as.IOBufferDuration) * 1000.0);
     if (st.buffers == 0) {
-        self.stats.text = [NSString stringWithFormat:@"Micro pas encore utilisé dans cette app.\nMoteur prévu : %@ → %s",
-                           req[s.engine], vs_engine_run_name(st.running)];
+        self.stats.text = [NSString stringWithFormat:@"Micro pas encore utilisé dans cette app.\nMoteur prévu : %@ → %@",
+                           req[s.engine], U(vs_engine_run_name(st.running))];
     } else {
         NSString *f0 = st.f0In > 0 ? [NSString stringWithFormat:@"\nHauteur : %.0f Hz → %.0f Hz", st.f0In, st.f0Out] : @"";
-        self.stats.text = [NSString stringWithFormat:@"Moteur actif : %s · %.0f kHz\nLatence ≈ %.0f ms (moteur %.0f + micro %.0f)\nProcesseur : %.1f %% (pic %.0f %%)%@",
-                           vs_engine_run_name(st.running), st.sampleRate / 1000.f, st.engineLatencyMs + io, st.engineLatencyMs, io,
+        self.stats.text = [NSString stringWithFormat:@"Moteur actif : %@ · %.0f kHz\nLatence ≈ %.0f ms (moteur %.0f + micro %.0f)\nProcesseur : %.1f %% (pic %.0f %%)%@",
+                           U(vs_engine_run_name(st.running)), st.sampleRate / 1000.f, st.engineLatencyMs + io, st.engineLatencyMs, io,
                            st.loadPct, st.peakPct, f0];
     }
     static const char *nm[] = {"AU", "AQ", "Cap", "Tap"};

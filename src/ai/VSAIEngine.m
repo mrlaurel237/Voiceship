@@ -41,7 +41,11 @@ static MLModel *load_model(MLComputeUnits units, NSString **err) {
     NSError *e = nil;
     if (![fm fileExistsAtPath:compiled]) {
         NSString *src = [BENCH_DIR stringByAppendingPathComponent:BENCH_NAME @".mlpackage"];
-        if (![fm fileExistsAtPath:src]) { *err = @"modèle de test introuvable (réinstalle le .deb)"; return nil; }
+        if (![fm isReadableFileAtPath:src]) {
+            // les apps (WhatsApp, TikTok…) sont isolées : elles n'ont pas le droit de lire les fichiers du tweak
+            *err = @"modèle illisible ici : lance la mesure depuis l'écran d'accueil (ou réinstalle le .deb).";
+            return nil;
+        }
         NSURL *tmp = [MLModel compileModelAtURL:[NSURL fileURLWithPath:src] error:&e];   // compilation sur l'iPhone
         if (!tmp) { *err = [NSString stringWithFormat:@"compilation Core ML impossible : %@", e.localizedDescription]; return nil; }
         [fm removeItemAtPath:compiled error:nil];
@@ -97,6 +101,13 @@ void vs_ai_benchmark(void (^done)(NSString *report)) {
         NSMutableString *r = [NSMutableString stringWithFormat:@"%@ — modèle taille LLVC (3,2 M paramètres)\n", device_name()];
         struct { MLComputeUnits u; NSString *name; } modes[] = { { MLComputeUnitsCPUOnly, @"CPU" }, { MLComputeUnitsAll, @"CPU+GPU(+NE)" } };
         BOOL anyOK = NO;
+        NSString *src = [BENCH_DIR stringByAppendingPathComponent:BENCH_NAME @".mlpackage"];
+        if (![NSFileManager.defaultManager isReadableFileAtPath:[src stringByAppendingPathComponent:@"Manifest.json"]]) {
+            [r appendString:@"Mesure impossible dans cette app : iOS l'empêche de lire les fichiers du tweak (c'est normal, ce n'est pas ton iPhone qui est en cause).\n"
+                            "→ Ferme l'app, puis touche l'icône rose sur l'ÉCRAN D'ACCUEIL et relance la mesure."];
+            dispatch_async(dispatch_get_main_queue(), ^{ done(r); });
+            return;
+        }
         for (int i = 0; i < 2; i++) {
             NSString *err = nil; double mean = 0, p95 = 0;
             MLModel *m = load_model(modes[i].u, &err);

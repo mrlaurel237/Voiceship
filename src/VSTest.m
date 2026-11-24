@@ -9,6 +9,9 @@
 #include "VSState.h"
 #include "VSEngine.h"
 
+// Les textes C sont en UTF-8 : %s les afficherait mal (« P√©tillante »). On passe par NSString.
+static inline NSString *U(const char *s) { return (s ? [NSString stringWithUTF8String:s] : nil) ?: @""; }
+
 extern IMP g_vsOrigTap;
 #define REC_SECONDS 5.0
 
@@ -182,8 +185,8 @@ extern IMP g_vsOrigTap;
             free(self->_proc); self->_proc = out; self->_procLen = n;
             free(in);
             double cpu = secs / (n / sr) * 100.0;
-            NSString *lbl = [NSString stringWithFormat:@"▶ B : moteur %s · calcul %.0f ms pour %.1f s (≈ %.1f %% du processeur) · latence %.0f ms",
-                             vs_engine_run_name(run), secs * 1000.0, n / sr, cpu, lat];
+            NSString *lbl = [NSString stringWithFormat:@"▶ B : moteur %@ · calcul %.0f ms pour %.1f s (≈ %.1f %% du processeur) · latence %.0f ms",
+                             U(vs_engine_run_name(run)), secs * 1000.0, n / sr, cpu, lat];
             [self playBuffer:self->_proc length:self->_procLen label:lbl];
         });
     });
