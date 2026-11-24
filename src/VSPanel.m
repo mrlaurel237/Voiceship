@@ -11,8 +11,12 @@
 extern volatile uint32_t g_vsCnt[4];
 extern volatile int g_vsOwner;
 
-static UIColor *vsAccent(void) { return [UIColor colorWithRed:0.62 green:0.36 blue:0.95 alpha:1]; }
-static UIColor *vsCard(void)   { return [UIColor colorWithWhite:0.2 alpha:1]; }
+// Thème : rose sur noir
+static UIColor *vsAccent(void) { return [UIColor colorWithRed:1.0 green:0.22 blue:0.52 alpha:1]; }
+static UIColor *vsCard(void)   { return [UIColor colorWithWhite:0.15 alpha:1]; }
+static const CGFloat FAB = 40;              // icône flottante : petite
+static const CGFloat FAB_IDLE = 0.38;       // transparence au repos (après 3 s)
+static const CGFloat FAB_ACTIVE = 0.85;     // quand on la touche
 
 @interface VSRootVC : UIViewController
 @property (nonatomic, strong) UIButton *fab;
@@ -25,7 +29,8 @@ static UIColor *vsCard(void)   { return [UIColor colorWithWhite:0.2 alpha:1]; }
 @property (nonatomic, strong) NSArray<UIButton *> *presetBtns;
 @property (nonatomic, strong) UIButton *fastModeBtn, *recBtn, *aBtn, *bBtn, *retryBtn, *aiBtn;
 @property (nonatomic, strong) UILabel *aiInfo;
-@property (nonatomic, strong) NSTimer *timer;
+@property (nonatomic, strong) NSTimer *timer, *sbTimer;
+@property (nonatomic, strong) UIButton *favBtn;
 @property (nonatomic) CGFloat y;
 - (void)refreshFromState;
 @end
@@ -93,26 +98,28 @@ static const CGFloat W = 300, PAD = 14;
     self.view.backgroundColor = UIColor.clearColor;
 
     self.fab = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.fab.frame = CGRectMake(16, 140, 52, 52);
-    self.fab.backgroundColor = [UIColor colorWithRed:0.35 green:0.25 blue:0.85 alpha:0.92];
-    self.fab.layer.cornerRadius = 26;
-    self.fab.layer.shadowOpacity = 0.35; self.fab.layer.shadowRadius = 5; self.fab.layer.shadowOffset = CGSizeMake(0, 2);
-    [self.fab setTitle:@"🎙" forState:UIControlStateNormal];
-    self.fab.titleLabel.font = [UIFont systemFontOfSize:24];
+    self.fab.frame = CGRectMake(0, 0, FAB, FAB);
+    self.fab.layer.cornerRadius = FAB / 2;
+    self.fab.layer.borderWidth = 1; self.fab.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:17 weight:UIImageSymbolWeightSemibold];
+    [self.fab setImage:[UIImage systemImageNamed:@"mic.fill" withConfiguration:cfg] forState:UIControlStateNormal];
+    self.fab.tintColor = UIColor.whiteColor;
     [self.fab addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
+    [self.fab addTarget:self action:@selector(wakeFab) forControlEvents:UIControlEventTouchDown];
     [self.fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragFab:)]];
     [self.view addSubview:self.fab];
 
     UIView *p = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, 560)];
-    p.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.97];
+    p.backgroundColor = [UIColor colorWithWhite:0.03 alpha:0.95];
+    p.layer.borderWidth = 1; p.layer.borderColor = [vsAccent() colorWithAlphaComponent:0.5].CGColor;
     p.layer.cornerRadius = 18; p.clipsToBounds = YES; p.hidden = YES;
     self.panel = p;
 
     UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(PAD, 10, 200, 28)];
-    t.text = @"VoiceShift 0.9"; t.textColor = UIColor.whiteColor; t.font = [UIFont boldSystemFontOfSize:20];
+    t.text = @"VoiceShift"; t.textColor = vsAccent(); t.font = [UIFont boldSystemFontOfSize:20];
     [p addSubview:t];
     UIButton *x = [UIButton buttonWithType:UIButtonTypeSystem];
-    x.frame = CGRectMake(W - 44, 6, 36, 36); [x setTitle:@"✕" forState:UIControlStateNormal];
+    x.frame = CGRectMake(W - 44, 6, 36, 36); [x setTitle:@"✕" forState:UIControlStateNormal]; x.tintColor = vsAccent();
     [x addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
     [p addSubview:x];
 
@@ -146,6 +153,8 @@ static const CGFloat W = 300, PAD = 14;
 
     // ── préréglages ──
     [self section:@"VOIX FÉMININE — PRÉRÉGLAGES"];
+    self.favBtn = [self button:@"★ Mon combo : Rapide + Douce" frame:CGRectMake(PAD, self.y, W - 2 * PAD, 36) action:@selector(favTap)];
+    self.y += 42;
     NSMutableArray *pb = [NSMutableArray new];
     CGFloat bw = (W - 2 * PAD - 16) / 3.f;
     for (int i = 0; i < VS_NPRESETS; i++) {
@@ -212,6 +221,44 @@ static const CGFloat W = 300, PAD = 14;
     __weak typeof(self) ws = self;
     VSTester.shared.onUpdate = ^(NSString *st) { ws.testInfo.text = st; [ws refreshTestButtons]; };
     [self refreshFromState];
+    [self placeFabAnimated:NO];
+    [self wakeFab];
+    vs_fab_on_change(^{ [ws placeFabAnimated:YES]; });
+    if (g_isSpringBoard) {          // SpringBoard : icône visible seulement sur l'écran d'accueil (sinon c'est celle de l'app)
+        [self updateSpringBoardVisibility];
+        self.sbTimer = [NSTimer scheduledTimerWithTimeInterval:0.7 repeats:YES block:^(NSTimer *t) { [ws updateSpringBoardVisibility]; }];
+    }
+}
+
+// ── icône flottante unique ──
+- (void)updateSpringBoardVisibility {
+    id app = UIApplication.sharedApplication;
+    SEL s = NSSelectorFromString(@"_accessibilityFrontMostApplication");
+    BOOL appInFront = NO;
+    if ([app respondsToSelector:s]) {
+        id front = ((id (*)(id, SEL))[app methodForSelector:s])(app, s);
+        appInFront = front != nil;
+    }
+    BOOL hide = appInFront && self.panel.hidden;
+    self.view.window.hidden = hide;
+}
+- (void)placeFabAnimated:(BOOL)anim {
+    CGRect b = self.view.bounds;
+    if (b.size.width < 10) return;
+    int side; float yf; vs_fab_get(&side, &yf);
+    CGFloat top = 50 + FAB / 2, bot = b.size.height - 40 - FAB / 2;
+    CGPoint c = CGPointMake(side ? b.size.width - FAB / 2 - 4 : FAB / 2 + 4, top + (bot - top) * yf);
+    if (anim) [UIView animateWithDuration:0.25 animations:^{ self.fab.center = c; }];
+    else self.fab.center = c;
+}
+- (void)wakeFab {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sleepFab) object:nil];
+    self.fab.alpha = FAB_ACTIVE;
+    [self performSelector:@selector(sleepFab) withObject:nil afterDelay:3.0];
+}
+- (void)sleepFab {
+    if (!self.panel.hidden) return;
+    [UIView animateWithDuration:0.6 animations:^{ self.fab.alpha = FAB_IDLE; }];
 }
 
 - (void)viewDidLayoutSubviews {
@@ -220,6 +267,7 @@ static const CGFloat W = 300, PAD = 14;
     CGFloat h = MIN(600.f, b.size.height - 90.f);
     self.panel.frame = CGRectMake((b.size.width - W) / 2.f, (b.size.height - h) / 2.f, W, h);
     self.scroll.frame = CGRectMake(0, 44, W, h - 44);
+    [self placeFabAnimated:NO];
 }
 
 // ── affichage ──
@@ -248,7 +296,9 @@ static const CGFloat W = 300, PAD = 14;
     self.fastModeBtn.alpha = s.engine == VS_ENGINE_FAST ? 1.0 : 0.45;
     for (UIControl *c in @[self.sSmooth, self.sVib, self.sExpr, self.swDeess, self.swGate, self.swEq])
         c.enabled = s.engine != VS_ENGINE_FAST;
-    self.fab.alpha = s.enabled ? 0.92 : 0.45;
+    // rose transparent quand la voix est modifiée, noir quand elle est désactivée
+    self.fab.backgroundColor = s.enabled ? [vsAccent() colorWithAlphaComponent:0.75] : [UIColor colorWithWhite:0.0 alpha:0.75];
+    self.favBtn.backgroundColor = (s.engine == VS_ENGINE_FAST && s.preset == 1) ? vsAccent() : vsCard();
     const char *lic = vs_license_label();
     self.licLabel.text = lic[0] ? [NSString stringWithUTF8String:lic] : @"";
     [self refreshStats];
@@ -257,7 +307,7 @@ static const CGFloat W = 300, PAD = 14;
 - (void)refreshTestButtons {
     VSTester *t = VSTester.shared;
     [self.recBtn setTitle:t.recording ? @"■ Stop" : @"● Enregistrer" forState:UIControlStateNormal];
-    self.recBtn.backgroundColor = t.recording ? [UIColor colorWithRed:0.8 green:0.2 blue:0.25 alpha:1] : vsCard();
+    self.recBtn.backgroundColor = t.recording ? [UIColor colorWithRed:0.9 green:0.1 blue:0.2 alpha:1] : vsCard();
     self.aBtn.enabled = self.bBtn.enabled = t.hasRecording && !t.recording;
     self.aBtn.alpha = self.bBtn.alpha = self.aBtn.enabled ? 1.0 : 0.4;
 }
@@ -305,6 +355,7 @@ static const CGFloat W = 300, PAD = 14;
 // ── actions ──
 - (void)togglePanel {
     self.panel.hidden = !self.panel.hidden;
+    [self wakeFab];
     [self.timer invalidate]; self.timer = nil;
     if (!self.panel.hidden) {
         [self refreshFromState];
@@ -315,11 +366,18 @@ static const CGFloat W = 300, PAD = 14;
     }
 }
 - (void)dragFab:(UIPanGestureRecognizer *)g {
+    [self wakeFab];
     CGPoint t = [g translationInView:self.view];
     CGPoint c = CGPointMake(self.fab.center.x + t.x, self.fab.center.y + t.y);
     CGRect b = self.view.bounds;
-    c.x = MAX(26, MIN(b.size.width - 26, c.x)); c.y = MAX(60, MIN(b.size.height - 60, c.y));
+    c.x = MAX(FAB / 2, MIN(b.size.width - FAB / 2, c.x)); c.y = MAX(50 + FAB / 2, MIN(b.size.height - 40 - FAB / 2, c.y));
     self.fab.center = c; [g setTranslation:CGPointZero inView:self.view];
+    if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
+        // collée au bord le plus proche, et même position dans toutes les apps
+        CGFloat top = 50 + FAB / 2, bot = b.size.height - 40 - FAB / 2;
+        vs_fab_set(c.x > b.size.width / 2 ? 1 : 0, (float)((c.y - top) / MAX(1.0, bot - top)));
+        [self placeFabAnimated:YES];
+    }
 }
 - (void)commit { vs_state_publish(); [self refreshFromState]; }
 - (void)swChanged:(UISwitch *)s { g_set.enabled = s.on; [self commit]; }
@@ -329,6 +387,7 @@ static const CGFloat W = 300, PAD = 14;
     [self commit];
 }
 - (void)preset:(UIButton *)b { vs_state_apply_preset((int)b.tag); [self commit]; }
+- (void)favTap { vs_state_apply_favorite(); vs_engine_retry(); [self commit]; }
 - (void)mainChanged:(UISlider *)sl {
     VSSettings s = g_set;
     if (sl == self.sSemi) s.semitones = roundf(sl.value * 2.f) / 2.f;

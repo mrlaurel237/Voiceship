@@ -44,6 +44,11 @@ uint64_t vs_state_pack(const VSSettings *s);
 int  vs_state_unpack(uint64_t st, VSSettings *s);
 void vs_state_init(void (^onChange)(void));  // charge, s'abonne aux changements
 void vs_state_publish(void);                 // après une modification locale
+void vs_state_apply_favorite(void);          // combo préféré : moteur Rapide + préréglage Douce
+// Position de l'icône flottante, partagée par toutes les apps (une seule icône, même place partout)
+void vs_fab_get(int *side, float *yFrac);    // side : 0 = bord gauche, 1 = bord droit ; yFrac : 0..1
+void vs_fab_set(int side, float yFrac);
+void vs_fab_on_change(void (^cb)(void));
 // conversions vers les paramètres DSP
 static inline float vs_set_smoothing(const VSSettings *s) { return (float)s->smooth / 7.f; }
 static inline float vs_set_vibrato(const VSSettings *s)   { return (float)s->vibrato / 7.f; }

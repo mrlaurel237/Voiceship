@@ -25,10 +25,11 @@ const VSPreset kVSPresets[VS_NPRESETS] = {
 
 void vs_state_defaults(VSSettings *s) {
     memset(s, 0, sizeof(*s));
-    s->enabled = 1; s->engine = VS_ENGINE_NATURAL; s->fastMode = 1; s->failSilence = 1;
+    // par défaut : le combo préféré (moteur Rapide + préréglage Douce)
+    s->enabled = 1; s->engine = VS_ENGINE_FAST; s->fastMode = 1; s->failSilence = 1;
     s->deesser = 1; s->gate = 1; s->eq = 1;
-    const VSPreset *p = &kVSPresets[1];
-    s->preset = 2; s->semitones = p->semitones; s->formantPct = p->formantPct; s->breath = p->breath;
+    const VSPreset *p = &kVSPresets[0];
+    s->preset = 1; s->semitones = p->semitones; s->formantPct = p->formantPct; s->breath = p->breath;
     s->smooth = p->smooth; s->vibrato = p->vibrato; s->expr = p->expr;
 }
 
@@ -63,6 +64,31 @@ void vs_state_apply_preset(int idx) {
     g_set = s;
 }
 
+void vs_state_apply_favorite(void) {
+    vs_state_apply_preset(1);
+    g_set.engine = VS_ENGINE_FAST;
+}
+
+// ── position de l'icône flottante ──
+static int g_fabToken = 0;
+static int g_fabSide = 1; static float g_fabY = 0.30f;
+static void (^g_fabCb)(void) = nil;
+static const char *kFabNote = "com.local.voiceshift.v9.fab";
+void vs_fab_get(int *side, float *yFrac) { *side = g_fabSide; *yFrac = g_fabY; }
+static uint64_t fab_pack(void) { return (1ULL << 63) | ((uint64_t)(g_fabSide & 1) << 16) | (uint64_t)lroundf(g_fabY * 1000.f); }
+static void fab_pull(void) {
+    uint64_t v = 0;
+    if (notify_get_state(g_fabToken, &v) != NOTIFY_STATUS_OK || !(v & (1ULL << 63))) return;
+    g_fabSide = (int)((v >> 16) & 1); g_fabY = (float)(v & 0xFFFF) / 1000.f;
+    if (g_fabY < 0.f || g_fabY > 1.f) g_fabY = 0.3f;
+}
+void vs_fab_set(int side, float yFrac) {
+    g_fabSide = side ? 1 : 0; g_fabY = yFrac < 0.f ? 0.f : (yFrac > 1.f ? 1.f : yFrac);
+    notify_set_state(g_fabToken, fab_pack());
+    notify_post(kFabNote);
+}
+void vs_fab_on_change(void (^cb)(void)) { g_fabCb = cb; }
+
 // ── format 64 bits publié par notifyd ──
 // 63 valide · 0 actif · 1-2 moteur · 3-4 qualité Rapide · 5-6 préréglage · 7 silence si panne
 // 8-15 demi-tons×2+64 · 16-21 formants+20 · 22-26 souffle×20 · 27-29 lissage · 30-32 vibrato
@@ -74,8 +100,8 @@ uint64_t vs_state_pack(const VSSettings *s) {
     v |= (uint64_t)(s->fastMode & 3) << 3;
     v |= (uint64_t)(s->preset & 3) << 5;
     v |= (uint64_t)(s->failSilence & 1) << 7;
-    v |= (uint64_t)((int)lroundf(s->semitones * 2.f) + 64 & 0xFF) << 8;
-    v |= (uint64_t)((int)lroundf(s->formantPct) + 20 & 0x3F) << 16;
+    v |= (uint64_t)(((int)lroundf(s->semitones * 2.f) + 64) & 0xFF) << 8;
+    v |= (uint64_t)(((int)lroundf(s->formantPct) + 20) & 0x3F) << 16;
     v |= (uint64_t)((int)lroundf(s->breath * 20.f) & 0x1F) << 22;
     v |= (uint64_t)(s->smooth & 7) << 27;
     v |= (uint64_t)(s->vibrato & 7) << 30;
@@ -107,11 +133,13 @@ int vs_state_unpack(uint64_t v, VSSettings *s) {
 }
 
 // ── fichier de configuration (SpringBoard uniquement) ──
+static int g_cfgVer = 0;
 static int load_v9(VSSettings *s) {
     for (int k = 0; k < 2; k++) {
         FILE *f = fopen(kConf[k], "r");
         if (!f) continue;
         char line[96];
+        g_cfgVer = 0;
         while (fgets(line, sizeof line, f)) {
             int i; float x;
             if (sscanf(line, "enabled=%d", &i) == 1) s->enabled = i;
@@ -128,6 +156,9 @@ static int load_v9(VSSettings *s) {
             else if (sscanf(line, "deesser=%d", &i) == 1) s->deesser = i;
             else if (sscanf(line, "gate=%d", &i) == 1) s->gate = i;
             else if (sscanf(line, "eq=%d", &i) == 1) s->eq = i;
+            else if (sscanf(line, "cfgver=%d", &i) == 1) g_cfgVer = i;
+            else if (sscanf(line, "fabside=%d", &i) == 1) g_fabSide = i & 1;
+            else if (sscanf(line, "faby=%f", &x) == 1) g_fabY = (x >= 0.f && x <= 1.f) ? x : 0.3f;
         }
         fclose(f);
         return 1;
@@ -160,10 +191,11 @@ static void save_file(void) {                   // ne réussit que hors sandbox 
     for (int k = 0; k < 2; k++) {
         FILE *f = fopen(kConf[k], "w");
         if (!f) continue;
+        fprintf(f, "cfgver=2\n");
         fprintf(f, "enabled=%d\nengine=%d\nfastmode=%d\npreset=%d\nfailsilence=%d\nsemitones=%.1f\nformantpct=%.0f\n"
-                   "breath=%.2f\nsmooth=%d\nvibrato=%d\nexpr=%d\ndeesser=%d\ngate=%d\neq=%d\n",
+                   "breath=%.2f\nsmooth=%d\nvibrato=%d\nexpr=%d\ndeesser=%d\ngate=%d\neq=%d\nfabside=%d\nfaby=%.3f\n",
                 s.enabled, s.engine, s.fastMode, s.preset, s.failSilence, s.semitones, s.formantPct,
-                s.breath, s.smooth, s.vibrato, s.expr, s.deesser, s.gate, s.eq);
+                s.breath, s.smooth, s.vibrato, s.expr, s.deesser, s.gate, s.eq, g_fabSide, g_fabY);
         fclose(f);
         return;
     }
@@ -187,7 +219,10 @@ void vs_state_publish(void) {
 void vs_state_init(void (^onChange)(void)) {
     vs_state_defaults(&g_set);
     if (g_isSpringBoard) {
-        if (!load_v9(&g_set)) load_v6(&g_set);
+        if (load_v9(&g_set)) {
+            // 0.9.2 : une seule fois, on passe au combo préféré (Rapide + Douce)
+            if (g_cfgVer < 2) { int en = g_set.enabled; vs_state_apply_favorite(); g_set.enabled = en; }
+        } else load_v6(&g_set);
         vs_state_clamp(&g_set);
     }
     notify_register_dispatch(kNote, &g_token, dispatch_get_main_queue(), ^(int t) {
@@ -196,8 +231,15 @@ void vs_state_init(void (^onChange)(void)) {
         if (g_isSpringBoard) save_file();
         if (onChange) onChange();
     });
+    notify_register_dispatch(kFabNote, &g_fabToken, dispatch_get_main_queue(), ^(int t) {
+        (void)t;
+        fab_pull();
+        if (g_isSpringBoard) save_file();
+        if (g_fabCb) g_fabCb();
+    });
     if (g_isSpringBoard) {                       // au démarrage : SpringBoard sème l'état pour toutes les apps
         notify_set_state(g_token, vs_state_pack(&g_set));
         notify_post(kNote);
-    } else pull();
+        notify_set_state(g_fabToken, fab_pack());
+    } else { pull(); fab_pull(); }
 }
